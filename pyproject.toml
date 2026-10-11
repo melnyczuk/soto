@@ -1,0 +1,64 @@
+[project]
+name = "soto"
+version = "0.1.0"
+description = "CLI that generates AI-blended transitions between two video clips, running locally on Mac MPS via a vendored ComfyUI + Wan2.1-VACE."
+readme = "README.md"
+authors = [
+    { name = "How", email = "how@melnycz.uk" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    # soto's own CLI
+    "typer>=0.12",
+    "huggingface-hub>=0.24",
+    "numpy>=1.26",
+
+    # ComfyUI's own runtime deps (we import it as a library, in-process --
+    # see src/soto/comfy_engine.py). Kept in lockstep with vendor/ComfyUI's
+    # own requirements.txt at the pinned commit in config.py.
+    "torch>=2.4",
+    "torchvision",
+    "torchaudio",
+    "torchsde",
+    "einops",
+    "transformers>=4.50.3",
+    "tokenizers>=0.13.3",
+    "sentencepiece",
+    "safetensors>=0.4.2",
+    "aiohttp>=3.11.8",
+    "yarl>=1.18.0",
+    "pyyaml",
+    "pillow",
+    "scipy",
+    "tqdm",
+    "psutil",
+    "alembic",
+    "sqlalchemy>=2.0.0",
+    "filelock",
+    "av>=16.0.0",
+    "requests",
+    "simpleeval>=1.0.0",
+    "kornia>=0.7.1",
+    "pydantic~=2.0",
+    "pydantic-settings~=2.0",
+    "pyopengl>=3.1.8",
+    "comfy-angle",
+    "spandrel",
+    "blake3",
+    "comfyui-frontend-package==1.48.6",
+    "comfyui-workflow-templates==0.11.31",
+    "comfyui-embedded-docs==0.5.9",
+    "comfy-kitchen==0.2.26",
+    "comfy-aimdo==0.4.13",
+
+    # ComfyUI-GGUF's own runtime deps.
+    "gguf>=0.13.0",
+    "protobuf",
+]
+
+[project.scripts]
+soto = "soto.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"

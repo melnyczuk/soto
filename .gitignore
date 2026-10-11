@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.pyc
+.uv/
+
+# Vendored ComfyUI + custom nodes (cloned by `soto setup`)
+vendor/
+
+# Downloaded weights (fetched by `soto setup`) -- the two large GGUF
+# checkpoints in models/ are intentionally NOT ignored, they're the
+# pre-downloaded starting point for this project.
+models
+models/vae/
+models/text_encoders/
+
+# ComfyUI's own generated dirs, if anything ever writes there
+vendor/ComfyUI/output/
+vendor/ComfyUI/input/
+vendor/ComfyUI/temp/
+vendor/ComfyUI/user/
+
+*.mp4
+*.log
+*.gguf
+
+.DS_Store
