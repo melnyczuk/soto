@@ -115,10 +115,14 @@ insurance and were left in.
 
 ## Working resolution
 
-`DEFAULT_WIDTH`/`DEFAULT_HEIGHT` (480x272) are smaller than VACE's native
-832x480 training resolution. MPS has no flash-attention/xformers, so ComfyUI
-falls back to full, non-windowed self-attention; even with the
-`inference_mode` fix, larger resolutions mean more tokens and more memory
-headroom needed. 480x272 leaves comfortable margin for reasonable
-`--duration`/`--context` frame counts; push resolution higher at your own
-risk of OOM.
+`DEFAULT_WIDTH`/`DEFAULT_HEIGHT` are 832x480, the preferred working
+resolution because it matches VACE's native training resolution. It's
+treated as a target area: each clip is processed at its own aspect ratio at
+about that many pixels, rounded to multiples of 16, and the generated frames
+are scaled back to the clip's native resolution on output.
+
+MPS has no flash-attention/xformers, so ComfyUI falls back to full,
+non-windowed self-attention, and higher resolutions and longer
+`--duration`/`--context` frame counts both mean more tokens and more memory.
+The earlier default was 480x272; if a long run runs out of memory, drop back
+towards that.

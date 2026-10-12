@@ -31,7 +31,9 @@ class ModelSpec:
     def __init__(self, filename: str, loader: str, remote_path: str | None = None):
         self.filename = filename
         self.loader = loader  # "UNETLoader" (standard) or "UnetLoaderGGUF"
-        self.remote_path = remote_path  # None if already present (e.g. pre-downloaded GGUF files)
+        self.remote_path = (
+            remote_path  # None if already present (e.g. pre-downloaded GGUF files)
+        )
 
 
 MODELS: dict[str, ModelSpec] = {
@@ -40,8 +42,12 @@ MODELS: dict[str, ModelSpec] = {
         loader="UNETLoader",
         remote_path="split_files/diffusion_models/wan2.1_vace_1.3B_fp16.safetensors",
     ),
-    "14b-q4": ModelSpec(filename="Wan2.1_14B_VACE-Q4_K_M.gguf", loader="UnetLoaderGGUF"),
-    "14b-q5": ModelSpec(filename="Wan2.1_14B_VACE-Q5_K_M.gguf", loader="UnetLoaderGGUF"),
+    "14b-q4": ModelSpec(
+        filename="Wan2.1_14B_VACE-Q4_K_M.gguf", loader="UnetLoaderGGUF"
+    ),
+    "14b-q5": ModelSpec(
+        filename="Wan2.1_14B_VACE-Q5_K_M.gguf", loader="UnetLoaderGGUF"
+    ),
 }
 DEFAULT_MODEL = "1.3b"
 
@@ -87,17 +93,20 @@ DEFAULT_PROMPT = (
 DEFAULT_DURATION_S = None  # required CLI flag, no sensible default
 DEFAULT_CONTEXT_S = 1.0
 
-# VACE's native training resolution (832x480) is too large for this backend:
-# MPS has no flash-attention/xformers, so ComfyUI falls back to full,
-# non-windowed self-attention, whose memory cost scales roughly quadratically
-# with token count. Measured directly at length=9 with the 1.3B model: 320x176
-# through 576x320 all ran in under a second at ~4.3GB; 640x368 was already
-# past the edge (didn't complete in 150s, vs <1s for everything at or below
-# 576x320). 480x272 keeps a comfortable margin below that cliff, with room
-# left for longer --duration/--context frame counts (which add to token count
-# the same way resolution does).
-DEFAULT_WIDTH = 480
-DEFAULT_HEIGHT = 272
+# 832x480 is the preferred working resolution: it's VACE's native training
+# resolution, so the model generates at the scale it was trained on rather
+# than extrapolating to a smaller one. This is a target *area* --
+# cli._fit_working_resolution keeps the source clip's aspect ratio at about
+# this many pixels, rounded to multiples of 16.
+#
+# Memory is the constraint: MPS has no flash-attention/xformers, so ComfyUI
+# falls back to full, non-windowed self-attention, whose cost scales roughly
+# quadratically with token count, and longer --duration/--context frame
+# counts add tokens the same way resolution does. 480x272 was the earlier
+# default, chosen when 640x368 looked like a hard limit; 832x480 now runs
+# successfully. If a long run OOMs, drop back towards 480x272.
+DEFAULT_WIDTH = 832
+DEFAULT_HEIGHT = 480
 
 # Wan's causal VAE has temporal stride 4 (+1 leading frame); WanVaceToVideo's
 # `length` should satisfy (length - 1) % 4 == 0 for a clean latent frame count.
