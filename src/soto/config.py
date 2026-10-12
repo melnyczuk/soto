@@ -62,6 +62,12 @@ TEXT_ENCODER_FILENAME = "umt5-xxl-encoder-Q5_K_M.gguf"
 
 VAE_DIR = MODELS_DIR / "vae"
 TEXT_ENCODERS_DIR = MODELS_DIR / "text_encoders"
+
+# pix2pixHD next-frame generators for `soto dream`, as `<name>.pth`. Not
+# downloaded by `soto setup`: they're the generators trained per video in
+# the older soto-pix2pixHD project (its checkpoints/<name>/latest_net_G.pth),
+# copied in by hand.
+PIX2PIXHD_DIR = MODELS_DIR / "pix2pixhd"
 # UNET goes directly in MODELS_DIR (flat), matching where the unused legacy
 # GGUF checkpoints already sit -- both map to extra_model_paths.yaml's
 # `diffusion_models: models/` entry, no separate subfolder needed.

@@ -49,6 +49,45 @@ one's output, so the clip grows by `frames * iterations` in total. Each pass
 uses `--seed + i`. `--context`, `--model`, `--prompt` and `--steps` behave as
 above.
 
+## Dreaming with pix2pixHD
+
+`dream` also continues a clip past its last frame, but with a pix2pixHD
+generator from the older soto-pix2pixHD project instead of VACE: a GAN
+trained on one video to predict each frame from the one before, fed its own
+output frame after frame, ported here for inference only
+([`pix2pixhd.py`](src/soto/pix2pixhd.py)). It takes seconds per second of
+footage rather than VACE's hours (~0.3s/frame at 1920x1088 on MPS), but it
+only knows the video its checkpoint was trained on. On that video it carries
+on from the last real frame and then drifts off into its own GAN-flavoured
+version of it. On anything else it jumps straight there.
+
+```bash
+uv run soto dream clip.mp4 -o output.mp4 --checkpoint nasa --frames 250
+```
+
+`--checkpoint` is the name of a generator in `models/pix2pixhd/` or a path to
+one. These aren't downloaded by `soto setup`; copy them in from the old
+project's `checkpoints/<name>/latest_net_G.pth` (only the generator is needed,
+not the discriminators or the per-epoch snapshots):
+
+```bash
+mkdir -p models/pix2pixhd
+cp ../soto-pix2pixHD/checkpoints/nasa/latest_net_G.pth models/pix2pixhd/nasa.pth
+```
+
+The architecture is read off the weights, so any pix2pixHD GlobalGenerator
+checkpoint with RGB in and out and instance norm will load. The clip is
+processed at its own resolution, rounded to multiples of 16, the same way
+the checkpoints were trained.
+
+The old feedback-loop camera moves come along too. `--zoom N` crops N pixels
+off each edge of every frame before feeding it back, for a steady push in.
+`--heat-seeking N` pans N pixels per frame toward the brightest quadrant,
+smoothed over 30 frames, plus N pixels of zoom so the pan never exposes the
+edges. They now run as a single resample on the GPU. The original went through
+uint8 and PIL for each move, and its truncation darkened every frame by about
+half a level per move.
+
 ## Softening the seams
 
 `transition`, `bridge` and `extend` all take `--crossfade N`: instead of

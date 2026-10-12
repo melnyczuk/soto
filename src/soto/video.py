@@ -11,11 +11,13 @@ there's no need for a second video I/O library that risks that collision."""
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -123,10 +125,14 @@ def conform(input_path: Path, output_path: Path, *, fps: float, width: int, heig
 
 
 def _write_frames_to_video(
-    frames: np.ndarray, fps: float, out_width: int, out_height: int, output_path: Path
+    frames: Iterable[np.ndarray], fps: float, out_width: int, out_height: int, output_path: Path
 ) -> None:
-    """frames: (N, H, W, 3) float32 in [0, 1] at any resolution -- scaled to out_width/out_height."""
-    n, h, w = frames.shape[0], frames.shape[1], frames.shape[2]
+    """frames: (N, H, W, 3) float32 in [0, 1] at any resolution -- scaled to
+    out_width/out_height. Any iterable of (H, W, 3) frames works too, and is
+    consumed lazily, so the frames never all have to be in memory at once."""
+    frames = iter(frames)
+    first = next(frames)
+    h, w = first.shape[0], first.shape[1]
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(fps),
@@ -136,8 +142,8 @@ def _write_frames_to_video(
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     assert proc.stdin is not None
-    for i in range(n):
-        frame_u8 = np.clip(frames[i] * 255.0, 0, 255).astype(np.uint8)
+    for frame in itertools.chain([first], frames):
+        frame_u8 = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
         proc.stdin.write(frame_u8.tobytes())
     proc.stdin.close()
     if proc.wait() != 0:
@@ -404,13 +410,14 @@ def append_frames(
     *,
     clip: Path,
     info: ClipInfo,
-    frames: np.ndarray,
+    frames: Iterable[np.ndarray],
     lead_in: np.ndarray,
     output_path: Path,
     tmp_dir: Path,
 ) -> None:
     """Writes `clip` followed by `frames` (at any resolution; scaled to the
-    clip's own). `lead_in` is VACE's decoded version of the clip's last
+    clip's own; an array, or an iterable consumed lazily as the extension is
+    encoded). `lead_in` is VACE's decoded version of the clip's last
     lead_in.shape[0] frames (may be empty), crossfaded over them to soften
     the seam. The original audio track (if any) is carried over as-is, so it
     ends where the original footage does."""

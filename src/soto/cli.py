@@ -172,6 +172,10 @@ def doctor() -> None:
     print(f"[{'ok' if te_ok else 'FAIL'}] models/text_encoders/{config.TEXT_ENCODER_FILENAME} (run `soto setup`)")
     ok &= te_ok
 
+    # Only `soto dream` needs these, so their absence is a warning, not a failure.
+    dreams = sorted(p.stem for p in config.PIX2PIXHD_DIR.glob("*.pth"))
+    print(f"[{'ok' if dreams else 'warn'}] models/pix2pixhd/ checkpoints for `soto dream`: {', '.join(dreams) or 'none'}")
+
     try:
         import torch
 
@@ -489,6 +493,87 @@ def extend(
         video.export_generated(
             [(clip, 0, info.n_frames - n_ctx), regenerated, *generated], info, export_generated, audio_source=clip
         )
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    shutil.rmtree(conform_dir, ignore_errors=True)
+    print(f"Done: {output}")
+
+
+def _resolve_checkpoint(checkpoint: str) -> Path:
+    """A path to a .pth file, or the name of one in models/pix2pixhd/."""
+    path = Path(checkpoint)
+    if path.is_file():
+        return path
+    named = config.PIX2PIXHD_DIR / f"{checkpoint}.pth"
+    if named.is_file():
+        return named
+    available = sorted(p.stem for p in config.PIX2PIXHD_DIR.glob("*.pth"))
+    raise typer.BadParameter(
+        f"no such file, and not one of the checkpoints in models/pix2pixhd/: {available}",
+        param_hint="--checkpoint",
+    )
+
+
+def _with_progress(frames, total: int):
+    for i, frame in enumerate(frames, 1):
+        print(f"\r  frame {i}/{total}", end="", flush=True)
+        yield frame
+    print()
+
+
+@app.command()
+def dream(
+    clip: Path = typer.Argument(..., exists=True, help="Clip to continue past its last frame."),
+    output: Path = typer.Option(..., "-o", "--output", help="Output video path."),
+    checkpoint: str = typer.Option(
+        ..., "--checkpoint",
+        help="pix2pixHD generator: the name of one in models/pix2pixhd/ (e.g. 'nasa') or a path to a .pth file.",
+    ),
+    frames: int = typer.Option(..., "--frames", min=1, help="Frames to dream."),
+    zoom: float = typer.Option(
+        0.0, "--zoom", min=0.0,
+        help="Pixels cropped off each edge of every dreamed frame (and scaled back up) before it's fed back in: "
+        "a steady push in.",
+    ),
+    heat_seeking: float = typer.Option(
+        0.0, "--heat-seeking", min=0.0,
+        help="Pixels per frame the camera drifts toward the brightest quadrant (smoothed over "
+        "30 frames), plus as much zoom again to keep the edges covered.",
+    ),
+) -> None:
+    """Continue a clip past its last frame with a pix2pixHD next-frame
+    generator fed its own output, frame by frame, and append the result.
+    Seconds per second of footage rather than `extend`'s hours, but it only
+    knows the one video its checkpoint was trained on."""
+    import numpy as np
+    import torch
+
+    from soto import pix2pixhd, video
+
+    weights = _resolve_checkpoint(checkpoint)
+    print(f"Probing {clip}...")
+    info = video.probe(clip)
+    conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
+    clip, info = _conform_clip(clip, info, conform_dir)
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    net, stride = pix2pixhd.load_generator(weights, device)
+    # The generator is fully convolutional, so it runs at the clip's own size
+    # (as it was trained on its video's), just rounded to its stride.
+    width, height = (max(stride, round(d / stride) * stride) for d in (info.width, info.height))
+    print(f"  working resolution {width}x{height}, {frames} frames ({frames / info.fps:.2f}s) on {device}")
+
+    start = video.extract_tail_context(clip, info, 1, width, height)[0]
+    print(f"Dreaming with {weights.name} and splicing...")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="soto-dream-"))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    video.append_frames(
+        clip=clip,
+        info=info,
+        frames=_with_progress(pix2pixhd.dream(net, start, frames, zoom=zoom, heat_seeking=heat_seeking), frames),
+        lead_in=np.zeros((0, height, width, 3), dtype=np.float32),
+        output_path=output,
+        tmp_dir=tmp_dir,
+    )
     shutil.rmtree(tmp_dir, ignore_errors=True)
     shutil.rmtree(conform_dir, ignore_errors=True)
     print(f"Done: {output}")
