@@ -32,6 +32,30 @@ def _fit_working_resolution(src_w: int, src_h: int) -> tuple[int, int]:
     return int(w), int(h)
 
 
+def _conform_clip(clip: Path, info, tmp_dir: Path, *, fps: float | None = None,
+                  size: tuple[int, int] | None = None):
+    """Returns (clip, info), re-encoded into `tmp_dir` only if the clip
+    doesn't already match `fps` and `size`. `size` defaults to the clip's own,
+    rounded down to even, since every segment is re-encoded as yuv420p
+    and that needs even dimensions."""
+    from soto import video
+
+    fps = fps if fps is not None else info.fps
+    width, height = size if size is not None else video.even_size(info.width, info.height)
+    changes = []
+    if abs(info.fps - fps) > 0.01:
+        changes.append(f"fps {info.fps:.3f} -> {fps:.3f}")
+    if (info.width, info.height) != (width, height):
+        changes.append(f"size {info.width}x{info.height} -> {width}x{height}")
+    if not changes:
+        return clip, info
+    print(f"  conforming {clip.name} ({', '.join(changes)})...")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    conformed = tmp_dir / f"{clip.stem}_conformed.mp4"
+    video.conform(clip, conformed, fps=fps, width=width, height=height)
+    return conformed, video.probe(conformed)
+
+
 def _run_vace(context_a, context_b, gap_frames: int, width: int, height: int,
               model: str, prompt: str, steps: int, seed: int):
     """Generates `gap_frames` between two context windows; returns the full
@@ -191,13 +215,13 @@ def transition(
     info_a = video.probe(clip_a)
     info_b = video.probe(clip_b)
 
-    if abs(info_a.fps - info_b.fps) > 0.01:
-        print(f"  fps mismatch ({info_a.fps:.3f} vs {info_b.fps:.3f}), resampling clip B to match clip A...")
-        tmp_dir = Path(tempfile.mkdtemp(prefix="soto-"))
-        resampled = tmp_dir / "clip_b_resampled.mp4"
-        video.resample_fps(clip_b, info_a.fps, resampled)
-        clip_b = resampled
-        info_b = video.probe(clip_b)
+    # Clip B is conformed to clip A's frame rate and size, so the two can be
+    # cut together into one stream.
+    conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
+    clip_a, info_a = _conform_clip(clip_a, info_a, conform_dir / "a")
+    clip_b, info_b = _conform_clip(
+        clip_b, info_b, conform_dir / "b", fps=info_a.fps, size=(info_a.width, info_a.height)
+    )
 
     fps = info_a.fps
     context_frames = max(1, round(context * fps))
@@ -254,6 +278,7 @@ def transition(
         tmp_dir=tmp_dir,
     )
     shutil.rmtree(tmp_dir, ignore_errors=True)
+    shutil.rmtree(conform_dir, ignore_errors=True)
     print(f"Done: {output}")
 
 
@@ -291,6 +316,8 @@ def bridge(
 
     print(f"Probing {clip}...")
     info = video.probe(clip)
+    conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
+    clip, info = _conform_clip(clip, info, conform_dir)
     fps = info.fps
 
     print(f"Scanning for blank frames matching {color} (tolerance {tolerance})...")
@@ -320,6 +347,7 @@ def bridge(
         plans.append((start, end, n_a, n_b))
 
     if not plans:
+        shutil.rmtree(conform_dir, ignore_errors=True)
         print("Nothing to bridge; no output written.")
         return
 
@@ -372,6 +400,7 @@ def bridge(
         print(f"Exporting generated frames to {export_generated}...")
         video.export_generated(parts, info, export_generated, audio_source=clip)
     shutil.rmtree(tmp_dir, ignore_errors=True)
+    shutil.rmtree(conform_dir, ignore_errors=True)
     print(f"Done: {output}")
 
 
@@ -408,6 +437,8 @@ def extend(
 
     print(f"Probing {clip}...")
     info = video.probe(clip)
+    conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
+    clip, info = _conform_clip(clip, info, conform_dir)
     fps = info.fps
     width, height = _fit_working_resolution(info.width, info.height)
 
@@ -459,6 +490,7 @@ def extend(
             [(clip, 0, info.n_frames - n_ctx), regenerated, *generated], info, export_generated, audio_source=clip
         )
     shutil.rmtree(tmp_dir, ignore_errors=True)
+    shutil.rmtree(conform_dir, ignore_errors=True)
     print(f"Done: {output}")
 
 

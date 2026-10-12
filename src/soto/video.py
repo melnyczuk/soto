@@ -102,10 +102,22 @@ def build_control_batch(
     return torch.from_numpy(video), torch.from_numpy(mask)
 
 
-def resample_fps(input_path: Path, target_fps: float, output_path: Path) -> None:
+def even_size(width: int, height: int) -> tuple[int, int]:
+    """libx264's yuv420p needs even dimensions; rounds odd ones down."""
+    return width - width % 2, height - height % 2
+
+
+def conform(input_path: Path, output_path: Path, *, fps: float, width: int, height: int) -> None:
+    """Re-encodes to `fps` and `width`x`height`. A different aspect ratio is
+    scaled to cover the frame and centre-cropped, never stretched or
+    letterboxed, so the model never sees distorted footage or black bars."""
+    vf = (
+        f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={width}:{height},setsar=1"
+    )
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", str(input_path),
-        "-r", str(target_fps), "-c:v", "libx264", "-pix_fmt", "yuv420p", str(output_path),
+        "-vf", vf, "-r", str(fps), "-c:v", "libx264", "-pix_fmt", "yuv420p", str(output_path),
     ]
     subprocess.run(cmd, check=True)
 
