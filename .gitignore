@@ -24,3 +24,5 @@ vendor/ComfyUI/user/
 *.gguf
 
 .DS_Store
+
+*.mkv

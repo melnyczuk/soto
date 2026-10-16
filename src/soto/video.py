@@ -125,30 +125,62 @@ def conform(input_path: Path, output_path: Path, *, fps: float, width: int, heig
     subprocess.run(cmd, check=True)
 
 
-def _write_frames_to_video(
-    frames: Iterable[np.ndarray], fps: float, out_width: int, out_height: int, output_path: Path
-) -> None:
-    """frames: (N, H, W, 3) float32 in [0, 1] at any resolution -- scaled to
-    out_width/out_height. Any iterable of (H, W, 3) frames works too, and is
-    consumed lazily, so the frames never all have to be in memory at once."""
+def _pipe_frames(frames: Iterable[np.ndarray], fps: float, output_path: Path, out_args: list[str]) -> int:
+    """Encodes (H, W, 3) float32 frames in [0, 1] with ffmpeg, `out_args`
+    choosing the filters and codec. The frames are consumed lazily, so they
+    never all have to be in memory at once. Returns how many there were."""
     frames = iter(frames)
     first = next(frames)
     h, w = first.shape[0], first.shape[1]
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(fps),
-        "-i", "-",
-        "-vf", f"scale={out_width}:{out_height}:flags=lanczos",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(output_path),
+        "-i", "-", *out_args, str(output_path),
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     assert proc.stdin is not None
+    n = 0
     for frame in itertools.chain([first], frames):
         frame_u8 = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
         proc.stdin.write(frame_u8.tobytes())
+        n += 1
     proc.stdin.close()
     if proc.wait() != 0:
         raise RuntimeError(f"ffmpeg failed writing {output_path}")
+    return n
+
+
+def _write_frames_to_video(
+    frames: Iterable[np.ndarray], fps: float, out_width: int, out_height: int, output_path: Path
+) -> None:
+    """frames: (N, H, W, 3) float32 in [0, 1] at any resolution -- scaled to
+    out_width/out_height. Any iterable of (H, W, 3) frames works too."""
+    _pipe_frames(frames, fps, output_path, [
+        "-vf", f"scale={out_width}:{out_height}:flags=lanczos", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+    ])
+
+
+def write_lossless(frames: Iterable[np.ndarray], fps: float, output_path: Path) -> int:
+    """Writes frames as they are, unscaled, as FFV1 in Matroska. Reading them
+    back with read_frames gives exactly the values _write_frames_to_video
+    would have encoded from the originals: both quantize the same way, and
+    k/255 * 255 comes back to k. Returns how many frames were written."""
+    return _pipe_frames(frames, fps, output_path, ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "bgr0"])
+
+
+def concat_lossless(parts: list[Path], output_path: Path) -> None:
+    """Joins write_lossless files by stream copy: FFV1 is intra-only, so it
+    can be cut and joined anywhere without re-encoding."""
+    list_file = output_path.with_suffix(".concat.txt")
+    list_file.write_text("\n".join(f"file '{p.resolve()}'" for p in parts))
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        list_file.unlink(missing_ok=True)
 
 
 def _scale_frames(frames: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -188,44 +220,6 @@ def crossfade_frames(
     return (1.0 - alpha) * real + alpha * generated
 
 
-def export_generated(
-    parts: list[tuple[Path, int, int] | np.ndarray],
-    info: ClipInfo,
-    output_path: Path,
-    audio_source: Path | None = None,
-    audio_offset_s: float = 0.0,
-) -> None:
-    """Writes `parts` in order as one clip at `info`'s native resolution and
-    frame rate. Each part is either a (clip, start_frame, end_frame_exclusive)
-    run of real footage or an array of the model's decoded frames (any
-    resolution); empty parts are skipped. For --export-generated: every frame
-    the model produced, padded out with real footage to the main output's
-    timeline so it can be laid straight over it in an editor."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="soto-export-"))
-    files: list[Path] = []
-    for i, part in enumerate(parts):
-        file = tmp_dir / f"part_{i:03d}.mp4"
-        if isinstance(part, np.ndarray):
-            if not part.shape[0]:
-                continue
-            _write_frames_to_video(part, info.fps, info.width, info.height, file)
-        else:
-            path, start, end = part
-            if end <= start:
-                continue
-            _trim_frames(path, start, end, file)
-        files.append(file)
-
-    if audio_source is None:
-        _concat(files, output_path)
-    else:
-        video_only = tmp_dir / "video_only.mp4"
-        _concat(files, video_only)
-        _mux_audio(video_only, audio_source, output_path, offset_s=audio_offset_s)
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
 def _trim_frames(input_path: Path, start_frame: int, end_frame: int | None, output_path: Path) -> None:
     """end_frame is exclusive; None means to the end of the clip."""
     if end_frame is not None:
@@ -252,61 +246,77 @@ def _concat(parts: list[Path], output_path: Path) -> None:
     list_file.unlink()
 
 
-def splice_output(
-    *,
-    clip_a: Path,
-    clip_b: Path,
-    info_a: ClipInfo,
-    info_b: ClipInfo,
-    generated_frames: torch.Tensor,
-    context_frames_a: int,
-    gap_frames: int,
-    context_frames_b: int,
-    crossfade: int,
+@dataclass
+class Real:
+    """Frames [start, end) of a clip, as they are."""
+    path: Path
+    start: int
+    end: int
+
+
+@dataclass
+class Fade:
+    """The real frames of `path` from `start`, blended with `generated`
+    (see crossfade_frames)."""
+    path: Path
+    start: int
+    generated: np.ndarray
+    fade_in: bool
+
+
+@dataclass
+class Generated:
+    """Frames [start, end) of a write_lossless file at `width`x`height`."""
+    path: Path
+    start: int
+    end: int
+    width: int
+    height: int
+
+
+def _read_chunked(part: Generated, chunk: int = 32) -> Iterable[np.ndarray]:
+    for start in range(part.start, part.end, chunk):
+        yield from _read_frames(part.path, start, min(chunk, part.end - start), part.width, part.height)
+
+
+def assemble(
+    parts: list[Real | Fade | Generated],
+    info: ClipInfo,
     output_path: Path,
-    tmp_dir: Path,
+    audio: tuple[Path, float] | None = None,
 ) -> None:
-    """Stitches clip_a + the generated gap + clip_b. The gap carries on from
-    clip_a's last frame and leads into clip_b's first (those were its
-    context), so both clips are kept whole -- except the `crossfade` frames
-    either side of the gap, which ramp from real footage into VACE's decoded
-    version of them and back out again (see crossfade_frames)."""
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    """Writes `parts` in order as one clip at `info`'s resolution and frame
+    rate. Real footage is cut out of its clip, and generated frames are
+    scaled up to the clip's size. `audio` is (clip, offset in seconds): that
+    clip's audio, if it has any, starting that far in; with None the output
+    is silent."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="soto-assemble-"))
+    files: list[Path] = []
+    for i, part in enumerate(parts):
+        file = tmp_dir / f"part_{i:03d}.mp4"
+        if isinstance(part, Real):
+            if part.end <= part.start:
+                continue
+            _trim_frames(part.path, part.start, part.end, file)
+        elif isinstance(part, Fade):
+            if not part.generated.shape[0]:
+                continue
+            blended = crossfade_frames(part.path, info, part.start, part.generated, part.fade_in)
+            _write_frames_to_video(blended, info.fps, info.width, info.height, file)
+        else:
+            if part.end <= part.start:
+                continue
+            _write_frames_to_video(_read_chunked(part), info.fps, info.width, info.height, file)
+        files.append(file)
 
-    generated = generated_frames.cpu().numpy()
-    gap_start = context_frames_a
-    gap_end = context_frames_a + gap_frames
-    fps, width, height = info_a.fps, info_a.width, info_a.height
-    parts: list[Path] = []
-
-    lead_end = info_a.n_frames - crossfade
-    if lead_end > 0:
-        lead_video = tmp_dir / "lead.mp4"
-        _trim_frames(clip_a, 0, lead_end, lead_video)
-        parts.append(lead_video)
-
-    if crossfade:
-        fade_a = crossfade_frames(clip_a, info_a, lead_end, generated[gap_start - crossfade:gap_start], fade_in=True)
-        fade_a_video = tmp_dir / "fade_a.mp4"
-        _write_frames_to_video(fade_a, fps, width, height, fade_a_video)
-        parts.append(fade_a_video)
-
-    gap_video = tmp_dir / "gap.mp4"
-    _write_frames_to_video(generated[gap_start:gap_end], fps, width, height, gap_video)
-    parts.append(gap_video)
-
-    if crossfade:
-        fade_b = crossfade_frames(clip_b, info_b, 0, generated[gap_end:gap_end + crossfade], fade_in=False)
-        fade_b_video = tmp_dir / "fade_b.mp4"
-        _write_frames_to_video(fade_b, fps, width, height, fade_b_video)
-        parts.append(fade_b_video)
-
-    if crossfade < info_b.n_frames:
-        tail_video = tmp_dir / "tail.mp4"
-        _trim_frames(clip_b, crossfade, None, tail_video)
-        parts.append(tail_video)
-
-    _concat(parts, output_path)
+    if audio is None:
+        _concat(files, output_path)
+    else:
+        video_only = tmp_dir / "video_only.mp4"
+        _concat(files, video_only)
+        _mux_audio(video_only, audio[0], output_path, offset_s=audio[1])
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def read_frames(path: Path, start_frame: int, n_frames: int, width: int, height: int,
@@ -359,106 +369,6 @@ def detect_flat_intervals(
         else:
             intervals.append((n, n + 1))
     return intervals
-
-
-def splice_fills(
-    *,
-    clip: Path,
-    info: ClipInfo,
-    fills: list[tuple[int, int, np.ndarray, np.ndarray, np.ndarray]],
-    output_path: Path,
-    tmp_dir: Path,
-) -> None:
-    """Rebuilds `clip` with each (start, end_exclusive, frames, before, after)
-    span replaced by `frames` (at any resolution; scaled back to the clip's
-    own). `before` / `after` are VACE's decoded versions of the real frames
-    just before `start` / from `end` (either may be empty), crossfaded over
-    those frames to soften each seam. Every fill is exactly as long as the
-    span it replaces, so the duration is unchanged and the original audio
-    track (if any) is carried over as-is."""
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    parts: list[Path] = []
-    cursor = 0
-    for i, (start, end, frames, before, after) in enumerate(sorted(fills, key=lambda f: f[0])):
-        fade_start = start - before.shape[0]
-        if fade_start > cursor:
-            real = tmp_dir / f"real_{i:03d}.mp4"
-            _trim_frames(clip, cursor, fade_start, real)
-            parts.append(real)
-        if before.shape[0]:
-            fade_in = tmp_dir / f"fade_in_{i:03d}.mp4"
-            blended = crossfade_frames(clip, info, fade_start, before, fade_in=True)
-            _write_frames_to_video(blended, info.fps, info.width, info.height, fade_in)
-            parts.append(fade_in)
-        gap = tmp_dir / f"gap_{i:03d}.mp4"
-        _write_frames_to_video(frames, info.fps, info.width, info.height, gap)
-        parts.append(gap)
-        if after.shape[0]:
-            fade_out = tmp_dir / f"fade_out_{i:03d}.mp4"
-            blended = crossfade_frames(clip, info, end, after, fade_in=False)
-            _write_frames_to_video(blended, info.fps, info.width, info.height, fade_out)
-            parts.append(fade_out)
-        cursor = end + after.shape[0]
-    if cursor < info.n_frames:
-        real = tmp_dir / "real_end.mp4"
-        _trim_frames(clip, cursor, None, real)
-        parts.append(real)
-
-    video_only = tmp_dir / "video_only.mp4"
-    _concat(parts, video_only)
-    _mux_audio(video_only, clip, output_path)
-
-
-def extend_frames(
-    *,
-    clip: Path,
-    info: ClipInfo,
-    head: np.ndarray | None,
-    head_fade: np.ndarray,
-    tail: Iterable[np.ndarray] | None,
-    tail_fade: np.ndarray,
-    output_path: Path,
-    tmp_dir: Path,
-) -> None:
-    """Writes `head` + `clip` + `tail`, where `head` / `tail` (either may be
-    None) are new frames at any resolution, scaled to the clip's own. `tail`
-    can also be an iterable, consumed lazily as it's encoded. `head_fade` /
-    `tail_fade` are VACE's decoded versions of the clip's first / last few
-    frames (either may be empty), crossfaded over them to soften each seam.
-    The original audio track (if any) is carried over as-is, delayed by the
-    length of `head` so it stays in sync with the real footage."""
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    parts: list[Path] = []
-    head_frames = 0
-    if head is not None:
-        head_video = tmp_dir / "head.mp4"
-        head_frames = head.shape[0]
-        _write_frames_to_video(head, info.fps, info.width, info.height, head_video)
-        parts.append(head_video)
-    real_start = head_fade.shape[0]
-    real_end = info.n_frames - tail_fade.shape[0]
-    if real_start:
-        fade = tmp_dir / "fade_head.mp4"
-        blended = crossfade_frames(clip, info, 0, head_fade, fade_in=False)
-        _write_frames_to_video(blended, info.fps, info.width, info.height, fade)
-        parts.append(fade)
-    if real_end > real_start:
-        real = tmp_dir / "real.mp4"
-        _trim_frames(clip, real_start, real_end, real)
-        parts.append(real)
-    if tail_fade.shape[0]:
-        fade = tmp_dir / "fade_tail.mp4"
-        blended = crossfade_frames(clip, info, real_end, tail_fade, fade_in=True)
-        _write_frames_to_video(blended, info.fps, info.width, info.height, fade)
-        parts.append(fade)
-    if tail is not None:
-        tail_video = tmp_dir / "tail.mp4"
-        _write_frames_to_video(tail, info.fps, info.width, info.height, tail_video)
-        parts.append(tail_video)
-
-    video_only = tmp_dir / "video_only.mp4"
-    _concat(parts, video_only)
-    _mux_audio(video_only, clip, output_path, offset_s=head_frames / info.fps)
 
 
 def _mux_audio(video_only: Path, audio_source: Path, output_path: Path, offset_s: float = 0.0) -> None:

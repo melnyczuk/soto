@@ -118,24 +118,40 @@ def _move_camera(x: torch.Tensor, zoom: float, heat_seeking: float, pans: deque)
 
 
 def dream(
-    net: nn.Module, start: np.ndarray, n_frames: int, *, zoom: float = 0.0, heat_seeking: float = 0.0
+    net: nn.Module, real: np.ndarray, n_frames: int, *, zoom: float = 0.0, heat_seeking: float = 0.0
 ) -> Iterator[np.ndarray]:
-    """Yields `n_frames` frames continuing on from `start`, each the
-    generator's prediction from the one before (after any camera move, which
-    is part of what gets fed back). `start` and every yielded frame are
-    (H, W, 3) float32 in [0, 1]; H and W must be multiples of the generator's
-    stride. Frames are computed lazily, one at a time, so a long dream never
-    has to fit in memory at once."""
+    """Yields the generator's version of all but the first of `real` (a clip's
+    last few frames), then `n_frames` frames continuing on from the last of
+    them. The first part is fed the real frames, each prediction made from
+    the real frame before it, so it lines up with the footage for
+    `soto crossfade` to blend into. The rest is fed its own output, each
+    frame the generator's prediction from the one before (after any camera
+    move, which is part of what gets fed back). `real` is (K + 1, H, W, 3) and
+    every yielded frame (H, W, 3), float32 in [0, 1]; H and W must be
+    multiples of the generator's stride. Frames are computed lazily, one at a
+    time, so a long dream never has to fit in memory at once."""
     device = next(net.parameters()).device
-    x = torch.from_numpy(start).to(device).permute(2, 0, 1)[None] * 2 - 1
+
+    def to_input(frame: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(frame).to(device).permute(2, 0, 1)[None] * 2 - 1
+
+    def to_frame(x: torch.Tensor) -> np.ndarray:
+        return ((x[0].permute(1, 2, 0) + 1) / 2).clamp(0, 1).cpu().numpy()
+
+    # Entered per frame rather than around the loops, so inference mode
+    # doesn't stay switched on in the caller's code while this is suspended
+    # at a yield.
+    for frame in real[:-1]:
+        with torch.inference_mode():
+            predicted = to_frame(net(to_input(frame)))
+        yield predicted
+
+    x = to_input(real[-1])
     pans = deque([(0.0, 0.0)] * HEAT_SEEKING_WINDOW, maxlen=HEAT_SEEKING_WINDOW)
     for _ in range(n_frames):
-        # Entered per frame rather than around the loop, so inference mode
-        # doesn't stay switched on in the caller's code while this is
-        # suspended at a yield.
         with torch.inference_mode():
             x = net(x)
             if zoom or heat_seeking:
                 x = _move_camera(x, zoom, heat_seeking, pans)
-            frame = ((x[0].permute(1, 2, 0) + 1) / 2).clamp(0, 1).cpu().numpy()
+            frame = to_frame(x)
         yield frame

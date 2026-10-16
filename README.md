@@ -26,11 +26,21 @@ uv run soto doctor    # verifies the environment
 
 ## Usage
 
+Making a video takes two steps. A generation command (`transition`,
+`bridge`, `extend` or `dream`) writes only what the model made. That's a
+lossless `.mkv` holding the generated frames plus the model's own version of
+the real context frames on either side, at working resolution. Then
+`soto crossfade` splices those frames into the original footage, fading
+from each real seam into the model's version of it. That takes seconds,
+so you can try as many fade lengths as you like without re-running the
+model:
+
 ```bash
-uv run soto transition clip_a.mp4 clip_b.mp4 -o output.mp4 --duration 1.5
+uv run soto transition clip_a.mp4 clip_b.mp4 -o gen.mkv --duration 1.5
+uv run soto crossfade gen.mkv -o output.mp4 --frames 8
 ```
 
-Key flags: `--duration` (seconds of *generated* transition, required),
+Transition's key flags: `--duration` (seconds of *generated* transition, required),
 `--context` (seconds of real context taken from each clip's edge, default
 1.0), `--model` (`1.3b` default, `14b-q4`, `14b-q5` -- see
 [`config.py`](src/soto/config.py)'s `MODELS` dict), `--prompt`, `--steps`,
@@ -39,7 +49,7 @@ Key flags: `--duration` (seconds of *generated* transition, required),
 To continue a clip past its last frame instead:
 
 ```bash
-uv run soto extend clip.mp4 -o output.mp4 --frames 32 --iterations 3
+uv run soto extend clip.mp4 -o gen.mkv --frames 32 --iterations 3
 ```
 
 `--frames` is how many frames each pass generates (exact; the context length
@@ -54,14 +64,14 @@ generates frames leading *into* the first frame, conditioned on the clip's
 head, and `bookend` does both:
 
 ```bash
-uv run soto extend clip.mp4 -o output.mp4 --frames 32 --side bookend
+uv run soto extend clip.mp4 -o gen.mkv --frames 32 --side bookend
 ```
 
 `--frames` and `--iterations` apply per side, so `bookend` adds twice as many
 frames. Both sides use the same per-pass seeds, so `--side start --seed S`
-reproduces the start of a `--side bookend --seed S` run. When frames are
-added at the start, the original audio is delayed to stay in sync with the
-real footage, and the new frames are silent.
+reproduces the start of a `--side bookend --seed S` run. When `crossfade`
+adds frames at the start, it delays the original audio to stay in sync with
+the real footage, and the new frames are silent.
 
 ## Previews
 
@@ -81,41 +91,50 @@ Every run ends by printing its seed. To render a draft properly, re-run it
 without `--preview` and with that seed:
 
 ```bash
-uv run soto transition a.mp4 b.mp4 -o draft.mp4 --duration 1.5 --preview draft
-uv run soto transition a.mp4 b.mp4 -o final.mp4 --duration 1.5 --seed 123456
+uv run soto transition a.mp4 b.mp4 -o draft.mkv --duration 1.5 --preview draft
+uv run soto transition a.mp4 b.mp4 -o final.mkv --duration 1.5 --seed 123456
 ```
 
 Passing `--steps` explicitly overrides the preview's step count. The tiers
-live in `config.PREVIEW_TIERS`. Output is still scaled back to the clip's
-native size, so you can lay a preview over the footage in an editor.
+live in `config.PREVIEW_TIERS`. `crossfade` still scales a preview back to
+the clip's native size.
 
 ## Run metadata
 
-Every command writes a sidecar next to its output (`out.mp4` gets
-`out.json`). The sidecar records:
+Every command writes a sidecar next to its output (`gen.mkv` gets
+`gen.json`). The sidecar records:
 
 - `settings`: what was actually used. That's the model and checkpoint,
   prompt and negative prompt, steps, seed (and whether it was given or
-  random), working resolution, CFG, sampler, scheduler, shift, and context
-  and crossfade. For `dream`, it's the checkpoint, its architecture, the
-  device, zoom and heat-seeking.
+  random), working resolution, CFG, sampler, scheduler, shift, and context.
+  For `dream`, it's the checkpoint, its architecture, the device, context,
+  zoom and heat-seeking. For `crossfade`, it's the fade length.
 - `adjustments`: every value soto changed from what you asked for, and why.
   For example: a gap rounded up to VACE's length stride, context nudged or
   cut short by the footage available, crossfades shared between neighbouring
   bridges, or steps lowered by `--preview`.
-- `inputs`: each clip's probe info and any conforming (frame rate, size).
+- `inputs`: each clip's probe info and any conforming (frame rate, size),
+  with the target in `conform_to`, so `crossfade` can conform it the same
+  way.
 - `runs`: one entry per model call, with its seed, steps, frame counts,
   where its context came from, and how long it took.
-- `segments`: the output timeline in frames, seconds and `HH:MM:SS:FF`
-  timecode. It shows where real footage, crossfades and generated frames
-  sit, and where each run's context starts and ends.
+- `segments`: what each stretch of the output is, in frames, seconds and
+  `HH:MM:SS:FF` timecode. In a generation command's `.mkv`, that's
+  `generated` frames and `context`, the model's version of real frames,
+  with the input and frames each one stands in for. In `crossfade`'s
+  output, it's `real` footage, `crossfade`s and `generated` frames.
+- `timeline` and `audio` (generation commands): how `crossfade` lays the
+  generated frames out among the real footage, and whose audio it carries
+  over, at what offset.
+- `generated_from` (`crossfade`): the `.mkv` it spliced and the command,
+  seed and model that made it.
 - `blank_intervals` (`bridge` only): each detected blank and whether it was
   bridged or skipped.
 - The git commit (and whether the tree was dirty), the command line, and
   start and finish times.
 
-The real, crossfade and generated segments are also embedded in the output
-as chapter markers, without re-encoding. They show up in QuickTime, VLC
+The segments are also embedded in the output as chapter markers, without
+re-encoding. They show up in QuickTime, VLC
 and mpv. Most NLEs (Resolve, Premiere) don't import mp4 chapters, so use the
 timecodes in the JSON there. Pass `--no-metadata` to skip both.
 
@@ -125,8 +144,11 @@ adjustments, and every model call so far, with the one that failed marked
 `"failed": true`. It also gets a `status` (`failed` or `interrupted`) and
 the error with its traceback. The record is kept separate so a crash never
 overwrites `out.json` from an earlier successful run. The next successful
-run to that output deletes it. Bad options (e.g. a `--crossfade` that's too
-long) are rejected before anything runs, so they don't leave a record.
+run to that output deletes it. Bad options (e.g. an `-o` that isn't a
+`.mkv`) are rejected before anything runs, so they don't leave a record.
+
+`crossfade` needs the generation's sidecar, so `--no-metadata` on a
+generation command means its output can't be spliced.
 
 ## Dreaming with pix2pixHD
 
@@ -141,8 +163,17 @@ on from the last real frame and then drifts off into its own GAN-flavoured
 version of it. On anything else it jumps straight there.
 
 ```bash
-uv run soto dream clip.mp4 -o output.mp4 --checkpoint nasa --frames 250
+uv run soto dream clip.mp4 -o gen.mkv --checkpoint nasa --frames 250
+uv run soto crossfade gen.mkv -o output.mp4 --frames 8
 ```
+
+For `crossfade` to blend into, it first runs the generator over the last
+`--context` seconds of the clip (1.0 by default), feeding it the real frames
+and predicting each from the one before. That's the generator's own version
+of those frames, lined up with the footage, at a cost of one extra pass per
+frame. The dream carries on from the clip's last frame, exactly as before.
+The `.mkv` is the clip's resolution rounded to multiples of 16, and lossless,
+so it's big (about 3MB per frame at 1920x1088).
 
 `--checkpoint` is the name of a generator in `models/pix2pixhd/` or a path to
 one. These aren't downloaded by `soto setup`; copy them in from the old
@@ -202,23 +233,31 @@ copy of itself scaled to fill the frame. It renders in seconds.
 
 ## Softening the seams
 
-`transition`, `bridge` and `extend` all take `--crossfade N`: instead of
-cutting straight from real footage to generated frames, the last/first `N`
-real frames at each seam are linearly blended into the model's own decoded
-version of those same frames (VACE regenerates its context frames too). The
-two line up frame-for-frame, so the blend doesn't ghost; it just eases the
-change in resolution, colour and texture. `N` comes out of the context, so it
-can't exceed it (in `bridge`, two neighbouring bridges also split the real
-footage between them). Output length is unchanged.
+VACE regenerates its context frames along with the new ones, and `dream`
+regenerates them from the real frames before them. A generation command keeps
+all of it in its `.mkv`. `soto crossfade GEN.mkv -o OUT.mp4 --frames N` then
+cuts the generated frames into the original footage. Instead of cutting
+straight from real footage to generated frames, the last/first `N` real
+frames at each seam are linearly blended into the model's version of those
+same frames. The two line up frame-for-frame, so the blend doesn't ghost; it
+just eases the change in resolution, colour and texture. `--frames 0` is a
+hard cut.
 
-To do the fade by hand instead, `--export-generated PATH` also writes every
-frame the model produced -- including its regeneration of the real context
-frames -- as one clip on the same timeline as the main output (same length,
-native resolution and frame rate), padded with the original footage wherever
-the model produced nothing. E.g. for `extend`, if the model's frames start at
-frame 210, the export is the clip's first 210 frames followed by all of them.
-Lay it over the output in an editor and fade between the two. Where two
-`bridge` runs' context overlaps, the later run's frames win.
+A fade comes out of its seam's context, so a longer `N` is cut down to it.
+Two fades over the same stretch of real footage split it between them: two
+bridges close together in `bridge`, or both ends of a short clip in
+`extend --side bookend`. Each cut is printed and logged in the output's
+`adjustments`. Output length doesn't depend on `N`.
+
+`crossfade` re-reads the original inputs from the paths in the sidecar,
+conforms them the same way the generation did, and refuses if any has
+changed since. It also refuses an `-o` whose sidecar would overwrite the
+generation's, such as `gen.mp4` next to `gen.mkv`.
+
+The `.mkv` is FFV1, so it plays in VLC and mpv but not QuickTime. Reading it
+back gives exactly the frames the model produced, so splicing it is the same
+as if the generation had spliced them itself. At 832x480 it's about 0.5MB a
+frame.
 
 ## Model choice: 1.3B vs the 14B GGUF checkpoints
 

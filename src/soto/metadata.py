@@ -1,7 +1,9 @@
 """Per-run metadata: an `<output>.json` sidecar recording what a command was
 asked to do, what it actually did (and every setting it changed along the
-way), and where each kind of footage sits on the output's timeline -- plus
-the same timeline embedded in the output as chapter markers."""
+way), and what each stretch of the output is -- plus the same segments
+embedded in the output as chapter markers. A generation command's sidecar
+also holds the `timeline` and `audio` that `soto crossfade` splices its
+frames into the original footage by."""
 
 from __future__ import annotations
 
@@ -18,11 +20,6 @@ from pathlib import Path
 import typer
 
 from soto import config
-
-# Segment kinds that tile the output timeline end to end, and so become
-# chapters. "context" spans overlap them, so stay in the JSON only.
-_CHAPTER_KINDS = ("real", "crossfade", "generated")
-
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -88,7 +85,9 @@ class RunLog:
     def settings(self) -> dict:
         return self.data["settings"]
 
-    def input(self, role: str, path: Path, info, conformed: list[str]) -> None:
+    def input(self, role: str, path: Path, info, conformed: list[str], conform_to: dict | None = None) -> None:
+        """`conform_to` is the fps and size the clip was conformed to, so
+        `soto crossfade` can conform it the same way again."""
         self.data["inputs"].append({
             "role": role,
             "path": str(Path(path).resolve()),
@@ -98,6 +97,7 @@ class RunLog:
             "frames": info.n_frames,
             "seconds": round(info.n_frames / info.fps, 3),
             "conformed": conformed,
+            **({"conform_to": conform_to} if conform_to else {}),
         })
 
     def adjust(self, setting: str, requested, used, reason: str) -> None:
@@ -137,7 +137,8 @@ class RunLog:
             raise
 
     def segment(self, kind: str, start: int, end: int, label: str | None = None, **details) -> None:
-        """One span [start, end) of the output, in output frame indices."""
+        """One span [start, end) of the output, in output frame indices.
+        Segments tile the output end to end, and each becomes a chapter."""
         if end <= start:
             return
         self.data["segments"].append({
@@ -154,14 +155,14 @@ class RunLog:
             seg["end_s"] = round(seg["end_frame"] / fps, 3)
             seg["start_tc"] = timecode(seg["start_frame"], fps)
             seg["end_tc"] = timecode(seg["end_frame"], fps)
-        self.data["segments"].sort(key=lambda s: (s["start_frame"], s["kind"] == "context"))
+        self.data["segments"].sort(key=lambda s: s["start_frame"])
 
     def write(self, output: Path, fps: float) -> Path | None:
         if not self.enabled:
             return None
         self.data["status"] = "ok"
         self._finish(fps)
-        chapters = [s for s in self.data["segments"] if s["kind"] in _CHAPTER_KINDS]
+        chapters = self.data["segments"]
         total = max((s["end_frame"] for s in chapters), default=0)
         self.data["output"] = {
             "path": str(output.resolve()),

@@ -12,14 +12,9 @@ from soto.metadata import RunLog
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
-_CROSSFADE_HELP = (
-    "Frames at each seam to crossfade from real footage into the model's own decoded version of it, "
-    "instead of cutting straight to generated frames. Taken from the context, so can't exceed it."
-)
-_EXPORT_HELP = (
-    "Also write every frame the model generated (including its regeneration of the real context "
-    "frames) as a clip on the same timeline as the output, padded with the original footage "
-    "wherever there are none -- for laying over the output and fading by hand in an editor."
+_OUTPUT_HELP = (
+    "Output path, a .mkv: every frame the model generated, including its own version of the real "
+    "context frames, losslessly at working resolution. Splice it into the footage with `soto crossfade`."
 )
 _PREVIEW_HELP = (
     f"Quick low-quality preview: {list(config.PREVIEW_TIERS)}. 'fast' drops the working resolution and steps; "
@@ -30,6 +25,53 @@ _NO_METADATA_HELP = (
     "Don't write the <output>.json sidecar (settings, seeds, timings and the timeline of real, context "
     "and generated frames) or embed its chapter markers in the output."
 )
+_GENERATED_NO_METADATA_HELP = _NO_METADATA_HELP + " Without it, `soto crossfade` can't splice the output."
+
+
+def _check_lossless_output(output: Path) -> None:
+    if output.suffix.lower() != ".mkv":
+        raise typer.BadParameter(
+            f"must be a .mkv, not {output.name!r}: the frames are kept losslessly as FFV1, which mp4 can't hold",
+            param_hint="--output",
+        )
+
+
+class _Pieces:
+    """Collects a generation command's output a piece at a time -- each one a
+    run of generated frames with the model's own version of the context on
+    either side -- written losslessly to a temp dir as it comes, so a long
+    bridge never holds every run in memory, then joined into the output."""
+
+    def __init__(self, fps: float):
+        self.fps = fps
+        self.dir = Path(tempfile.mkdtemp(prefix="soto-pieces-"))
+        self.files: list[Path] = []
+        self.frames = 0
+
+    def add(self, frames) -> int:
+        """Appends `frames` (an array or a lazy iterable); returns the frame
+        of the output it starts at."""
+        from soto import video
+
+        start = self.frames
+        file = self.dir / f"piece_{len(self.files):03d}.mkv"
+        self.frames += video.write_lossless(frames, self.fps, file)
+        self.files.append(file)
+        return start
+
+    def write(self, output: Path) -> None:
+        from soto import video
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        video.concat_lossless(self.files, output)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def _context_segment(log: RunLog, start: int, n: int, label: str, source: str, source_start: int, **details) -> None:
+    """Frames [start, start + n) of the output are the model's version of
+    real frames [source_start, source_start + n) of input `source`."""
+    log.segment("context", start, start + n, label, source=source,
+                source_frames=[source_start, source_start + n], **details)
 
 
 def _fit_working_resolution(src_w: int, src_h: int, area: int | None = None) -> tuple[int, int]:
@@ -65,8 +107,7 @@ def _resolve_seed(seed: int | None, log: RunLog) -> int:
 
 
 def _log_vace_settings(log: RunLog, *, model: str, prompt: str, steps: int, preview: str | None,
-                       width: int, height: int, context: float, crossfade: int,
-                       export_generated: Path | None) -> None:
+                       width: int, height: int, context: float | None = None) -> None:
     log.settings.update({
         "model": model,
         "checkpoint": config.MODELS[model].filename,
@@ -82,10 +123,9 @@ def _log_vace_settings(log: RunLog, *, model: str, prompt: str, steps: int, prev
         "denoise": config.DENOISE,
         "vae_device": config.VAE_DEVICE,
         "vae_dtype": config.VAE_DTYPE if config.VAE_DEVICE == "gpu" else "fp32",
-        "context_s": context,
-        "crossfade_frames": crossfade,
-        "export_generated": str(export_generated.resolve()) if export_generated else None,
     })
+    if context is not None:
+        log.settings["context_s"] = context
 
 
 def _context_reason(want: int, available: int, used: int) -> str:
@@ -101,11 +141,14 @@ def _preview_note(preview: str | None) -> str:
     return f" (preview: {preview})" if preview else ""
 
 
-def _print_done(output: Path, seed: int, preview: str | None, log: RunLog, fps: float) -> None:
+def _print_done(output: Path, seed: int | None, preview: str | None, log: RunLog, fps: float, *,
+                generated: bool = True) -> None:
     log.write(output, fps)
-    print(f"Done: {output} (seed={seed})")
+    print(f"Done: {output}" + (f" (seed={seed})" if seed is not None else ""))
     if preview:
         print(f"Preview only -- re-run without --preview and with --seed {seed} for the full-quality version.")
+    if generated and log.enabled:
+        print(f"Splice it into the footage with: soto crossfade {output} -o {output.with_suffix('.mp4')} --frames 8")
 
 
 def _conform_clip(clip: Path, info, tmp_dir: Path, log: RunLog, role: str, *, fps: float | None = None,
@@ -123,7 +166,7 @@ def _conform_clip(clip: Path, info, tmp_dir: Path, log: RunLog, role: str, *, fp
         changes.append(f"fps {info.fps:.3f} -> {fps:.3f}")
     if (info.width, info.height) != (width, height):
         changes.append(f"size {info.width}x{info.height} -> {width}x{height}")
-    log.input(role, clip, info, changes)
+    log.input(role, clip, info, changes, conform_to={"fps": fps, "width": width, "height": height})
     if not changes:
         return clip, info
     print(f"  conforming {clip.name} ({', '.join(changes)})...")
@@ -271,7 +314,7 @@ def doctor() -> None:
 def transition(
     clip_a: Path = typer.Argument(..., exists=True, help="First clip (the transition plays out of this one)."),
     clip_b: Path = typer.Argument(..., exists=True, help="Second clip (the transition plays into this one)."),
-    output: Path = typer.Option(..., "-o", "--output", help="Output video path."),
+    output: Path = typer.Option(..., "-o", "--output", help=_OUTPUT_HELP),
     duration: float = typer.Option(..., "--duration", help="Seconds of *generated* transition."),
     context: float = typer.Option(
         config.DEFAULT_CONTEXT_S, "--context", help="Seconds of real context taken from each clip's edge."
@@ -284,13 +327,13 @@ def transition(
     steps: int = typer.Option(None, "--steps", help=_STEPS_HELP),
     preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
     seed: int = typer.Option(None, "--seed", help="Random seed (default: random each run)."),
-    crossfade: int = typer.Option(0, "--crossfade", min=0, help=_CROSSFADE_HELP),
-    export_generated: Path = typer.Option(None, "--export-generated", dir_okay=False, help=_EXPORT_HELP),
-    no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
+    no_metadata: bool = typer.Option(False, "--no-metadata", help=_GENERATED_NO_METADATA_HELP),
 ) -> None:
-    """Generate an AI-blended transition between two clips and splice it in."""
+    """Generate an AI-blended transition between two clips, to splice in
+    with `soto crossfade`."""
     if model not in config.MODELS:
         raise typer.BadParameter(f"--model must be one of {list(config.MODELS)}")
+    _check_lossless_output(output)
     log = RunLog("transition", enabled=not no_metadata)
     with log.guard(output):
         area, steps = _resolve_quality(preview, steps, log)
@@ -324,7 +367,7 @@ def transition(
 
         width, height = _fit_working_resolution(info_a.width, info_a.height, area)
         _log_vace_settings(log, model=model, prompt=prompt, steps=steps, preview=preview, width=width, height=height,
-                           context=context, crossfade=crossfade, export_generated=export_generated)
+                           context=context)
         log.settings.update({"duration_s": duration, "gap_frames": gap_frames, "context_frames": context_frames})
         print(f"  working resolution {width}x{height}{_preview_note(preview)}, "
               f"{context_frames} context frames/side, {gap_frames} gap frames")
@@ -336,11 +379,6 @@ def transition(
         for side, n in (("a", n_a), ("b", n_b)):
             if n < context_frames:
                 log.adjust(f"context_frames_{side}", context_frames, n, f"clip {side} only has {n} frames")
-        max_crossfade = min(n_a, n_b)
-        if crossfade > max_crossfade:
-            raise typer.BadParameter(
-                f"can't exceed the {max_crossfade} context frames per side", param_hint="--crossfade"
-            )
 
         resolved_seed = _resolve_seed(seed, log)
         print(f"Running Wan2.1-VACE ({model}) transition (seed={resolved_seed}, steps={steps})...")
@@ -349,45 +387,22 @@ def transition(
                      context_source_before={"clip": "a", "frames": [info_a.n_frames - n_a, info_a.n_frames]},
                      context_source_after={"clip": "b", "frames": [0, n_b]}):
             result = _run_vace(context_a, context_b, gap_frames, width, height, model, prompt, steps, resolved_seed)
-        if export_generated is not None:
-            print(f"Exporting generated frames to {export_generated}...")
-            video.export_generated(
-                [
-                    (clip_a, 0, info_a.n_frames - context_a.shape[0]),
-                    result.frames.cpu().numpy(),
-                    (clip_b, context_b.shape[0], info_b.n_frames),
-                ],
-                info_a,
-                export_generated,
-            )
 
-        print("Splicing final output...")
-        tmp_dir = Path(tempfile.mkdtemp(prefix="soto-splice-"))
-        output.parent.mkdir(parents=True, exist_ok=True)
-        video.splice_output(
-            clip_a=clip_a,
-            clip_b=clip_b,
-            info_a=info_a,
-            info_b=info_b,
-            generated_frames=result.frames,
-            context_frames_a=context_a.shape[0],
-            gap_frames=gap_frames,
-            context_frames_b=context_b.shape[0],
-            crossfade=crossfade,
-            output_path=output,
-            tmp_dir=tmp_dir,
-        )
-        # Output timeline: all of clip A, the gap, then all of clip B.
-        gap_start, gap_end = info_a.n_frames, info_a.n_frames + gap_frames
-        log.segment("real", 0, gap_start - crossfade, "clip a", source="a", source_frames=[0, gap_start - crossfade])
-        log.segment("crossfade", gap_start - crossfade, gap_start, "crossfade out of clip a", run=1)
-        log.segment("generated", gap_start, gap_end, f"generated (seed {resolved_seed})", run=1)
-        log.segment("crossfade", gap_end, gap_end + crossfade, "crossfade into clip b", run=1)
-        log.segment("real", gap_end + crossfade, gap_end + info_b.n_frames, "clip b",
-                    source="b", source_frames=[crossfade, info_b.n_frames])
-        log.segment("context", gap_start - n_a, gap_start, "context from clip a", run=1)
-        log.segment("context", gap_end, gap_end + n_b, "context from clip b", run=1)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        print(f"Writing {output}...")
+        pieces = _Pieces(fps)
+        pieces.add(result.frames.cpu().numpy())
+        pieces.write(output)
+        # The output is the whole run: context from a, the gap, context from b.
+        gap_end = n_a + gap_frames
+        _context_segment(log, 0, n_a, "context from clip a", "a", info_a.n_frames - n_a, run=1)
+        log.segment("generated", n_a, gap_end, f"generated (seed {resolved_seed})", run=1)
+        _context_segment(log, gap_end, n_b, "context from clip b", "b", 0, run=1)
+        # Spliced: all of clip A, the gap, then all of clip B.
+        log.append("timeline", {"kind": "real", "source": "a", "source_frames": [0, info_a.n_frames]})
+        log.append("timeline", {"kind": "generated", "file_frames": [n_a, gap_end],
+                                "label": f"generated (seed {resolved_seed})"})
+        log.append("timeline", {"kind": "real", "source": "b", "source_frames": [0, info_b.n_frames]})
+        log.data["audio"] = None
         shutil.rmtree(conform_dir, ignore_errors=True)
         _print_done(output, resolved_seed, preview, log, fps)
 
@@ -395,7 +410,7 @@ def transition(
 @app.command()
 def bridge(
     clip: Path = typer.Argument(..., exists=True, help="Clip containing blank (flat-colour) intervals."),
-    output: Path = typer.Option(..., "-o", "--output", help="Output video path."),
+    output: Path = typer.Option(..., "-o", "--output", help=_OUTPUT_HELP),
     color: str = typer.Option("#000000", "--color", help="Hex colour of the blank frames, e.g. '#000000' or 'fff'."),
     tolerance: float = typer.Option(
         0.12, "--tolerance", help="Max per-channel distance from --color (0-1) for a pixel to count as blank."
@@ -412,13 +427,13 @@ def bridge(
     steps: int = typer.Option(None, "--steps", help=_STEPS_HELP),
     preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
     seed: int = typer.Option(None, "--seed", help="Random seed (default: random each run)."),
-    crossfade: int = typer.Option(0, "--crossfade", min=0, help=_CROSSFADE_HELP),
-    export_generated: Path = typer.Option(None, "--export-generated", dir_okay=False, help=_EXPORT_HELP),
-    no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
+    no_metadata: bool = typer.Option(False, "--no-metadata", help=_GENERATED_NO_METADATA_HELP),
 ) -> None:
-    """Find blank intervals inside a clip and replace each with a generated bridge."""
+    """Find blank intervals inside a clip and generate a bridge for each, to
+    splice in with `soto crossfade`."""
     if model not in config.MODELS:
         raise typer.BadParameter(f"--model must be one of {list(config.MODELS)}")
+    _check_lossless_output(output)
     log = RunLog("bridge", enabled=not no_metadata)
     with log.guard(output):
         area, steps = _resolve_quality(preview, steps, log)
@@ -441,7 +456,7 @@ def bridge(
         context_frames = max(1, round(context * fps))
         width, height = _fit_working_resolution(info.width, info.height, area)
         _log_vace_settings(log, model=model, prompt=prompt, steps=steps, preview=preview, width=width, height=height,
-                           context=context, crossfade=crossfade, export_generated=export_generated)
+                           context=context)
         log.settings.update({"color": color, "tolerance": tolerance, "max_gap_s": max_gap,
                              "context_frames": context_frames})
 
@@ -482,77 +497,36 @@ def bridge(
             print("Nothing to bridge; no output written.")
             return
 
-        # Crossfades come out of each side's context, and two neighbouring
-        # bridges can't both fade over the same real frames, so split any shared
-        # stretch of real footage between them.
-        fades = [[min(crossfade, n_a), min(crossfade, n_b)] for _, _, n_a, n_b in plans]
-        for (_, prev_end, _, _), (start, _, _, _), prev, cur in zip(plans, plans[1:], fades, fades[1:]):
-            real = start - prev_end
-            if prev[1] + cur[0] > real:
-                prev[1] = min(prev[1], real // 2)
-                cur[0] = min(cur[0], real - prev[1])
-        if crossfade:
-            for (start, end, n_a, n_b), (x_a, x_b) in zip(plans, fades):
-                for side, used, n in (("before", x_a, n_a), ("after", x_b, n_b)):
-                    if used < crossfade:
-                        reason = (f"limited to the {n} context frames" if used == n
-                                  else "split with the neighbouring bridge's fade over shared real footage")
-                        log.adjust(f"crossfade_{side} (frames {start}-{end - 1})", crossfade, used, reason)
-
         resolved_seed = _resolve_seed(seed, log)
         print(f"Working resolution {width}x{height}{_preview_note(preview)}, seed={resolved_seed}, steps={steps}")
-        fills = []
-        decoded_runs = []
-        for k, ((start, end, n_a, n_b), (x_a, x_b)) in enumerate(zip(plans, fades), 1):
-            fade_note = f" with {x_a}+{x_b} crossfade frames" if crossfade else ""
-            print(f"[{k}/{len(plans)}] Running Wan2.1-VACE ({model}) for frames {start}-{end - 1}{fade_note}...")
+        pieces = _Pieces(fps)
+        cursor = 0
+        for k, (start, end, n_a, n_b) in enumerate(plans, 1):
+            print(f"[{k}/{len(plans)}] Running Wan2.1-VACE ({model}) for frames {start}-{end - 1}...")
             context_a = video.read_frames(clip, start - n_a, n_a, width, height)
             context_b = video.read_frames(clip, end, n_b, width, height)
             with log.run(seed=resolved_seed, steps=steps, context_frames_before=n_a, gap_frames=end - start,
-                         context_frames_after=n_b, gap=[start, end], crossfade=[x_a, x_b]):
+                         context_frames_after=n_b, gap=[start, end]):
                 result = _run_vace(
                     context_a, context_b, end - start, width, height, model, prompt, steps, resolved_seed
                 )
-            if export_generated is not None:
-                decoded_runs.append((start - n_a, end + n_b, result.frames.cpu().numpy()))
-            gap_end = n_a + (end - start)
-            fills.append((
-                start,
-                end,
-                result.frames[n_a:gap_end].cpu().numpy(),
-                result.frames[n_a - x_a:n_a].cpu().numpy(),
-                result.frames[gap_end:gap_end + x_b].cpu().numpy(),
-            ))
+            # Each run goes into the output whole: its context, the bridge,
+            # its context.
+            offset = pieces.add(result.frames.cpu().numpy())
+            gap_start, gap_end = offset + n_a, offset + n_a + (end - start)
+            _context_segment(log, offset, n_a, f"context before bridge {k}", "clip", start - n_a, run=k)
+            log.segment("generated", gap_start, gap_end, f"bridge {k} (seed {resolved_seed})", run=k)
+            _context_segment(log, gap_end, n_b, f"context after bridge {k}", "clip", end, run=k)
+            # Spliced, bridging keeps every frame where it was.
+            log.append("timeline", {"kind": "real", "source": "clip", "source_frames": [cursor, start]})
+            log.append("timeline", {"kind": "generated", "file_frames": [gap_start, gap_end],
+                                    "label": f"bridge {k} (seed {resolved_seed})"})
+            cursor = end
+        log.append("timeline", {"kind": "real", "source": "clip", "source_frames": [cursor, info.n_frames]})
+        log.data["audio"] = {"source": "clip", "offset_frames": 0}
 
-        print("Splicing final output...")
-        tmp_dir = Path(tempfile.mkdtemp(prefix="soto-bridge-"))
-        output.parent.mkdir(parents=True, exist_ok=True)
-        video.splice_fills(clip=clip, info=info, fills=fills, output_path=output, tmp_dir=tmp_dir)
-        if export_generated is not None:
-            # Neighbouring runs' context can overlap; where it does, the earlier
-            # run's trailing frames give way to the later run's leading ones.
-            parts = []
-            cursor = 0
-            for i, (run_start, run_end, decoded) in enumerate(decoded_runs):
-                parts.append((clip, cursor, run_start))
-                next_start = decoded_runs[i + 1][0] if i + 1 < len(decoded_runs) else run_end
-                parts.append(decoded[:min(run_end, next_start) - run_start])
-                cursor = min(run_end, next_start)
-            parts.append((clip, cursor, info.n_frames))
-            print(f"Exporting generated frames to {export_generated}...")
-            video.export_generated(parts, info, export_generated, audio_source=clip)
-        # Bridging keeps every frame where it was, so output frames are input frames.
-        cursor = 0
-        for k, ((start, end, n_a, n_b), (x_a, x_b)) in enumerate(zip(plans, fades), 1):
-            log.segment("real", cursor, start - x_a, "clip", source="clip", source_frames=[cursor, start - x_a])
-            log.segment("crossfade", start - x_a, start, f"crossfade into bridge {k}", run=k)
-            log.segment("generated", start, end, f"bridge {k} (seed {resolved_seed})", run=k)
-            log.segment("crossfade", end, end + x_b, f"crossfade out of bridge {k}", run=k)
-            log.segment("context", start - n_a, start, f"context before bridge {k}", run=k)
-            log.segment("context", end, end + n_b, f"context after bridge {k}", run=k)
-            cursor = end + x_b
-        log.segment("real", cursor, info.n_frames, "clip", source="clip", source_frames=[cursor, info.n_frames])
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        print(f"Writing {output}...")
+        pieces.write(output)
         shutil.rmtree(conform_dir, ignore_errors=True)
         _print_done(output, resolved_seed, preview, log, fps)
 
@@ -564,7 +538,7 @@ def _extend_side(clip: Path, info, n_ctx: int, frames: int, iterations: int, wid
                  model: str, prompt: str, steps: int, seed: int, log: RunLog, *, at_start: bool):
     """Runs `extend`'s iterations off one end of the clip. Returns (chunks,
     regenerated): the new frames in time order, and VACE's decoded version
-    of the n_ctx real frames at that end, for the crossfade."""
+    of the n_ctx real frames at that end, for `soto crossfade` to blend into."""
     import numpy as np
 
     from soto import video
@@ -613,7 +587,7 @@ def _extend_side(clip: Path, info, n_ctx: int, frames: int, iterations: int, wid
 @app.command()
 def extend(
     clip: Path = typer.Argument(..., exists=True, help="Clip to extend before its first frame and/or past its last."),
-    output: Path = typer.Option(..., "-o", "--output", help="Output video path."),
+    output: Path = typer.Option(..., "-o", "--output", help=_OUTPUT_HELP),
     frames: int = typer.Option(..., "--frames", min=1, help="Frames to generate per iteration, per side."),
     iterations: int = typer.Option(
         1, "--iterations", min=1,
@@ -634,16 +608,16 @@ def extend(
     steps: int = typer.Option(None, "--steps", help=_STEPS_HELP),
     preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
     seed: int = typer.Option(None, "--seed", help="Random seed (default: random each run)."),
-    crossfade: int = typer.Option(0, "--crossfade", min=0, help=_CROSSFADE_HELP),
-    export_generated: Path = typer.Option(None, "--export-generated", dir_okay=False, help=_EXPORT_HELP),
-    no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
+    no_metadata: bool = typer.Option(False, "--no-metadata", help=_GENERATED_NO_METADATA_HELP),
 ) -> None:
     """Generate new frames leading into the start of a clip, continuing on
-    from its end, or both, optionally several times over, and add them."""
+    from its end, or both, optionally several times over, to add with
+    `soto crossfade`."""
     if model not in config.MODELS:
         raise typer.BadParameter(f"--model must be one of {list(config.MODELS)}")
     if side not in _EXTEND_SIDES:
         raise typer.BadParameter(f"must be one of {list(_EXTEND_SIDES)}", param_hint="--side")
+    _check_lossless_output(output)
     log = RunLog("extend", enabled=not no_metadata)
     with log.guard(output):
         area, steps = _resolve_quality(preview, steps, log)
@@ -668,19 +642,12 @@ def extend(
             raise typer.BadParameter(f"{clip} is too short to take context from", param_hint="clip")
         if n_ctx != want_ctx:
             log.adjust("context_frames", want_ctx, n_ctx, _context_reason(want_ctx, info.n_frames, n_ctx))
-        if crossfade > n_ctx:
-            raise typer.BadParameter(f"can't exceed the {n_ctx} context frames", param_hint="--crossfade")
-        if do_start and do_end and 2 * crossfade > info.n_frames:
-            raise typer.BadParameter(
-                f"the fades at both ends can't overlap: at most {info.n_frames // 2} for this clip",
-                param_hint="--crossfade",
-            )
         total = frames * iterations
         print(f"  working resolution {width}x{height}{_preview_note(preview)}, {n_ctx} context frames, "
               f"{iterations} x {frames} new frames ({total / fps:.2f}s) at the {side}")
 
         _log_vace_settings(log, model=model, prompt=prompt, steps=steps, preview=preview, width=width, height=height,
-                           context=context, crossfade=crossfade, export_generated=export_generated)
+                           context=context)
         log.settings.update({"side": side, "frames": frames, "iterations": iterations, "context_frames": n_ctx})
         resolved_seed = _resolve_seed(seed, log)
         log.settings["seed_note"] = "iteration i (from 0) on each side uses seed + i"
@@ -691,61 +658,36 @@ def extend(
         head, head_regen = _extend_side(*args, at_start=True) if do_start else ([], None)
         tail, tail_regen = _extend_side(*args, at_start=False) if do_end else ([], None)
 
-        print("Splicing final output...")
-        tmp_dir = Path(tempfile.mkdtemp(prefix="soto-extend-"))
-        output.parent.mkdir(parents=True, exist_ok=True)
-        empty = np.zeros((0, height, width, 3), dtype=np.float32)
-        video.extend_frames(
-            clip=clip,
-            info=info,
-            head=np.concatenate(head, axis=0) if head else None,
-            head_fade=head_regen[:crossfade] if do_start else empty,
-            tail=np.concatenate(tail, axis=0) if tail else None,
-            tail_fade=tail_regen[n_ctx - crossfade:] if do_end else empty,
-            output_path=output,
-            tmp_dir=tmp_dir,
-        )
-        if export_generated is not None:
-            # On a clip shorter than both contexts together, the regenerated
-            # start and end overlap; the end's frames win there.
-            head_ctx = min(n_ctx, info.n_frames - n_ctx) if do_start and do_end else n_ctx
-            real_start = head_ctx if do_start else 0
-            real_end = info.n_frames - n_ctx if do_end else info.n_frames
-            print(f"Exporting generated frames to {export_generated}...")
-            video.export_generated(
-                [
-                    *head,
-                    *([head_regen[:head_ctx]] if do_start else []),
-                    (clip, real_start, real_end),
-                    *([tail_regen] if do_end else []),
-                    *tail,
-                ],
-                info,
-                export_generated,
-                audio_source=clip,
-                audio_offset_s=total / fps if do_start else 0.0,
-            )
-        # Output timeline: [new head] + clip + [new tail]. Each iteration's
-        # context is the n_ctx frames next to its new frames, real or generated.
-        clip_start = total if do_start else 0
-        clip_end = clip_start + info.n_frames
-        x_head, x_tail = (crossfade if do_start else 0), (crossfade if do_end else 0)
+        # The output is a piece per side, each the new frames with the model's
+        # version of the real frames they join on to:
+        # [start iterations, earliest first][context] [context][end iterations].
+        print(f"Writing {output}...")
+        pieces = _Pieces(fps)
         for i in range(iterations if do_start else 0):
-            g = clip_start - (i + 1) * frames
+            g = (iterations - 1 - i) * frames
             log.segment("generated", g, g + frames, f"start, iteration {i + 1} (seed {(resolved_seed + i) % 2**32})",
                         side="start", iteration=i + 1)
-            log.segment("context", g + frames, g + frames + n_ctx, f"context for start iteration {i + 1}",
-                        side="start", iteration=i + 1)
-        log.segment("crossfade", clip_start, clip_start + x_head, "crossfade into clip", side="start")
-        log.segment("real", clip_start + x_head, clip_end - x_tail, "clip",
-                    source="clip", source_frames=[x_head, info.n_frames - x_tail])
-        log.segment("crossfade", clip_end - x_tail, clip_end, "crossfade out of clip", side="end")
-        for i in range(iterations if do_end else 0):
-            g = clip_end + i * frames
-            log.segment("generated", g, g + frames, f"end, iteration {i + 1} (seed {(resolved_seed + i) % 2**32})",
-                        side="end", iteration=i + 1)
-            log.segment("context", g - n_ctx, g, f"context for end iteration {i + 1}", side="end", iteration=i + 1)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if do_start:
+            pieces.add(np.concatenate([*head, head_regen], axis=0))
+            _context_segment(log, total, n_ctx, "context from the clip's start", "clip", 0, side="start")
+        if do_end:
+            offset = pieces.add(np.concatenate([tail_regen, *tail], axis=0))
+            _context_segment(log, offset, n_ctx, "context from the clip's end", "clip", info.n_frames - n_ctx,
+                             side="end")
+            for i in range(iterations):
+                g = offset + n_ctx + i * frames
+                log.segment("generated", g, g + frames, f"end, iteration {i + 1} (seed {(resolved_seed + i) % 2**32})",
+                            side="end", iteration=i + 1)
+        pieces.write(output)
+
+        # Spliced: [new head] + clip + [new tail], the audio delayed by the head.
+        if do_start:
+            log.append("timeline", {"kind": "generated", "file_frames": [0, total], "label": "extended start"})
+        log.append("timeline", {"kind": "real", "source": "clip", "source_frames": [0, info.n_frames]})
+        if do_end:
+            log.append("timeline", {"kind": "generated", "file_frames": [offset + n_ctx, offset + n_ctx + total],
+                                    "label": "extended end"})
+        log.data["audio"] = {"source": "clip", "offset_frames": total if do_start else 0}
         shutil.rmtree(conform_dir, ignore_errors=True)
         _print_done(output, resolved_seed, preview, log, fps)
 
@@ -775,12 +717,21 @@ def _with_progress(frames, total: int):
 @app.command()
 def dream(
     clip: Path = typer.Argument(..., exists=True, help="Clip to continue past its last frame."),
-    output: Path = typer.Option(..., "-o", "--output", help="Output video path."),
+    output: Path = typer.Option(
+        ..., "-o", "--output",
+        help="Output path, a .mkv: the dreamed frames, preceded by the generator's own version of the "
+        "context frames, losslessly. Splice it onto the clip with `soto crossfade`.",
+    ),
     checkpoint: str = typer.Option(
         ..., "--checkpoint",
         help="pix2pixHD generator: the name of one in models/pix2pixhd/ (e.g. 'nasa') or a path to a .pth file.",
     ),
     frames: int = typer.Option(..., "--frames", min=1, help="Frames to dream."),
+    context: float = typer.Option(
+        config.DEFAULT_CONTEXT_S, "--context", min=0.0,
+        help="Seconds at the end of the clip to also run the generator over, each frame predicted from "
+        "the real one before it, for `soto crossfade` to blend into. Can't exceed the clip.",
+    ),
     zoom: float = typer.Option(
         0.0, "--zoom", min=0.0,
         help="Pixels cropped off each edge of every dreamed frame (and scaled back up) before it's fed back in: "
@@ -791,17 +742,17 @@ def dream(
         help="Pixels per frame the camera drifts toward the brightest quadrant (smoothed over "
         "30 frames), plus as much zoom again to keep the edges covered.",
     ),
-    no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
+    no_metadata: bool = typer.Option(False, "--no-metadata", help=_GENERATED_NO_METADATA_HELP),
 ) -> None:
     """Continue a clip past its last frame with a pix2pixHD next-frame
-    generator fed its own output, frame by frame, and append the result.
-    Seconds per second of footage rather than `extend`'s hours, but it only
-    knows the one video its checkpoint was trained on."""
-    import numpy as np
+    generator fed its own output, frame by frame, to add with `soto
+    crossfade`. Seconds per second of footage rather than `extend`'s hours,
+    but it only knows the one video its checkpoint was trained on."""
     import torch
 
     from soto import pix2pixhd, video
 
+    _check_lossless_output(output)
     log = RunLog("dream", enabled=not no_metadata)
     with log.guard(output):
         weights = _resolve_checkpoint(checkpoint)
@@ -823,38 +774,41 @@ def dream(
             "architecture": architecture,
             "device": str(device),
             "frames": frames,
+            "context_s": context,
             "zoom": zoom,
             "heat_seeking": heat_seeking,
             "working_resolution": [width, height],
             "seed": None,
             "seed_note": "no randomness: the same clip, checkpoint and settings dream the same frames",
         })
-        print(f"  working resolution {width}x{height}, {frames} frames ({frames / info.fps:.2f}s) on {device}")
+        # Each context frame is predicted from the real one before it, so the
+        # clip's first frame can't be one.
+        want_ctx = round(context * info.fps)
+        n_ctx = min(want_ctx, info.n_frames - 1)
+        if n_ctx != want_ctx:
+            log.adjust("context_frames", want_ctx, n_ctx,
+                       f"the clip only has {info.n_frames} frames, and the first has none before it")
+        log.settings["context_frames"] = n_ctx
+        print(f"  working resolution {width}x{height}, {n_ctx} context frames, "
+              f"{frames} frames ({frames / info.fps:.2f}s) on {device}")
 
-        start = video.extract_tail_context(clip, info, 1, width, height)[0]
-        print(f"Dreaming with {weights.name} and splicing...")
-        tmp_dir = Path(tempfile.mkdtemp(prefix="soto-dream-"))
-        output.parent.mkdir(parents=True, exist_ok=True)
+        real = video.extract_tail_context(clip, info, n_ctx + 1, width, height)
+        print(f"Dreaming with {weights.name} into {output}...")
+        pieces = _Pieces(info.fps)
         # Frames are dreamed lazily as they're encoded, so this times both.
-        with log.run(frames=frames, context_frames=1,
-                     context_source={"clip": "clip", "frames": [info.n_frames - 1, info.n_frames]}):
-            video.extend_frames(
-                clip=clip,
-                info=info,
-                head=None,
-                head_fade=np.zeros((0, height, width, 3), dtype=np.float32),
-                tail=_with_progress(pix2pixhd.dream(net, start, frames, zoom=zoom, heat_seeking=heat_seeking), frames),
-                tail_fade=np.zeros((0, height, width, 3), dtype=np.float32),
-                output_path=output,
-                tmp_dir=tmp_dir,
-            )
-        log.segment("real", 0, info.n_frames, "clip", source="clip", source_frames=[0, info.n_frames])
-        log.segment("context", info.n_frames - 1, info.n_frames, "starting frame", run=1)
-        log.segment("generated", info.n_frames, info.n_frames + frames, f"dreamed ({weights.stem})", run=1)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        with log.run(frames=frames, context_frames=n_ctx,
+                     context_source={"clip": "clip", "frames": [info.n_frames - n_ctx - 1, info.n_frames]}):
+            dreamed = pix2pixhd.dream(net, real, frames, zoom=zoom, heat_seeking=heat_seeking)
+            pieces.add(_with_progress(dreamed, n_ctx + frames))
+        pieces.write(output)
+        _context_segment(log, 0, n_ctx, "context from the clip's end", "clip", info.n_frames - n_ctx, run=1)
+        log.segment("generated", n_ctx, n_ctx + frames, f"dreamed ({weights.stem})", run=1)
+        log.append("timeline", {"kind": "real", "source": "clip", "source_frames": [0, info.n_frames]})
+        log.append("timeline", {"kind": "generated", "file_frames": [n_ctx, n_ctx + frames],
+                                "label": f"dreamed ({weights.stem})"})
+        log.data["audio"] = {"source": "clip", "offset_frames": 0}
         shutil.rmtree(conform_dir, ignore_errors=True)
-        log.write(output, info.fps)
-        print(f"Done: {output}")
+        _print_done(output, None, None, log, info.fps)
 
 
 def _parse_size(value: str) -> tuple[int, int]:
@@ -1040,9 +994,9 @@ def expand(
         width, height = _fit_working_resolution(out_w, out_h, area)
         work_rect = _scale_rect(rect, width / out_w, height / out_h, width, height)
         _log_vace_settings(log, model=model, prompt=prompt, steps=steps, preview=preview, width=width,
-                           height=height, context=0.0, crossfade=0, export_generated=export_generated)
-        del log.settings["context_s"], log.settings["crossfade_frames"]
+                           height=height)
         log.settings.update({
+            "export_generated": str(export_generated.resolve()) if export_generated else None,
             "source_rect_working": list(work_rect),
             "window": window,
             "overlap": overlap,
@@ -1067,7 +1021,185 @@ def expand(
                                  fps, out_w, out_h, clip, export_generated)
         log.segment("real", 0, info.n_frames, "clip, expanded", source="clip", source_frames=[0, info.n_frames])
         shutil.rmtree(conform_dir, ignore_errors=True)
-        _print_done(output, resolved_seed, preview, log, fps)
+        _print_done(output, resolved_seed, preview, log, fps, generated=False)
+
+
+_CROSSFADE_HELP = (
+    "Frames at each seam to crossfade from the real footage into the model's own version of it, instead of "
+    "cutting straight to the generated frames. Each fade comes out of its seam's context frames, so it's "
+    "limited to them, and two fades over the same stretch of real footage split it between them."
+)
+
+
+def _load_generated(generated: Path, output: Path) -> dict:
+    """Reads and checks the sidecar of a generation command's output."""
+    import json
+
+    sidecar = generated.with_suffix(".json")
+    if not sidecar.is_file():
+        raise typer.BadParameter(f"no sidecar at {sidecar}: was it generated with --no-metadata?",
+                                 param_hint="generated")
+    data = json.loads(sidecar.read_text())
+    if data.get("status") != "ok" or "timeline" not in data:
+        raise typer.BadParameter(
+            f"{sidecar} isn't from a finished transition, bridge, extend or dream run (or is from before "
+            "they wrote a timeline)", param_hint="generated",
+        )
+    if output.resolve() == generated.resolve() or output.with_suffix(".json").resolve() == sidecar.resolve():
+        raise typer.BadParameter(f"would overwrite {generated.name} or its sidecar: pick another name",
+                                 param_hint="--output")
+    return data
+
+
+def _plan_fades(timeline: list[dict], segments: list[dict], want: int, log: RunLog) -> list[list[dict | None]]:
+    """For each timeline entry, the fade at its start and at its end (None
+    for none; generated entries never have one). Each fade is {frames,
+    file_edge, label}: `frames` of the real footage at that edge blend into
+    the model's version of them, the generated output's frames just before
+    (or from) `file_edge`."""
+    context = [seg for seg in segments if seg["kind"] == "context"]
+    ending = {seg["end_frame"]: seg for seg in context}
+    starting = {seg["start_frame"]: seg for seg in context}
+    fades: list[list[dict | None]] = [[None, None] for _ in timeline]
+    limits = {}
+    for i, entry in enumerate(timeline):
+        if entry["kind"] != "generated":
+            continue
+        g0, g1 = entry["file_frames"]
+        # The context before a generated stretch is the end of the real
+        # footage before it (side 1), the context after it the start of the
+        # real footage after it (side 0).
+        for j, ctx, side, file_edge in ((i - 1, ending.get(g0), 1, g0), (i + 1, starting.get(g1), 0, g1)):
+            if ctx is None or not 0 <= j < len(timeline) or timeline[j]["kind"] != "real":
+                continue
+            real = timeline[j]
+            if ctx["source"] != real["source"] or ctx["source_frames"][side] != real["source_frames"][side]:
+                raise RuntimeError(f"the sidecar's {ctx['label']!r} doesn't line up with the footage next to it")
+            n_ctx = ctx["end_frame"] - ctx["start_frame"]
+            fades[j][side] = {"frames": min(want, n_ctx), "file_edge": file_edge, "label": entry["label"]}
+            limits[id(fades[j][side])] = n_ctx
+
+    # A stretch of real footage between two generated ones can't fade at
+    # both ends over the same frames, so split it between them.
+    for entry, (start, end) in zip(timeline, fades):
+        if entry["kind"] != "real":
+            continue
+        length = entry["source_frames"][1] - entry["source_frames"][0]
+        x_start, x_end = (start or {}).get("frames", 0), (end or {}).get("frames", 0)
+        if x_start + x_end > length:
+            x_start = min(x_start, length // 2)
+            x_end = min(x_end, length - x_start)
+        for fade, used, verb in ((start, x_start, "out of"), (end, x_end, "into")):
+            if fade is None:
+                continue
+            fade["frames"] = used
+            if used < want:
+                n_ctx = limits[id(fade)]
+                reason = (f"limited to the {n_ctx} context frames" if used == n_ctx
+                          else "split with the fade at the other end of the same real footage")
+                print(f"  crossfade {verb} {fade['label']}: {used} frames ({reason})")
+                log.adjust(f"crossfade {verb} {fade['label']}", want, used, reason)
+    return fades
+
+
+@app.command()
+def crossfade(
+    generated: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, help="A .mkv written by transition, bridge, extend or dream."
+    ),
+    output: Path = typer.Option(
+        ..., "-o", "--output",
+        help="Output video path. A new file: not the input, and not one whose .json sidecar would replace the "
+        "input's (so not the same name with another extension, in the same folder).",
+    ),
+    frames: int = typer.Option(..., "--frames", min=0, help=_CROSSFADE_HELP),
+    no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
+) -> None:
+    """Splice a generation command's frames into the footage they came from,
+    crossfading each seam from the real frames into the model's own version
+    of them. Takes seconds, so try as many --frames as you like."""
+    data = _load_generated(generated, output)
+    log = RunLog("crossfade", enabled=not no_metadata)
+    with log.guard(output):
+        from soto import video
+
+        made = video.probe(generated)
+        if made.n_frames != data["output"]["frames"]:
+            raise typer.BadParameter(
+                f"has {made.n_frames} frames, but its sidecar says {data['output']['frames']}",
+                param_hint="generated",
+            )
+        log.input("generated", generated, made, [])
+        settings = data["settings"]
+        log.settings.update({
+            "frames": frames,
+            "generated_from": {
+                "path": str(generated.resolve()),
+                "command": data["command"],
+                "seed": settings.get("seed"),
+                "model": settings.get("model"),
+                "checkpoint": settings.get("checkpoint"),
+            },
+        })
+
+        # The footage, conformed just as it was for generating.
+        conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
+        sources = {}
+        for recorded in data["inputs"]:
+            role, path = recorded["role"], Path(recorded["path"])
+            if not path.is_file():
+                raise typer.BadParameter(f"{path} (input {role!r}) no longer exists", param_hint="generated")
+            info = video.probe(path)
+            if ((info.width, info.height, info.n_frames) != (recorded["width"], recorded["height"], recorded["frames"])
+                    or abs(info.fps - recorded["fps"]) > 1e-6):
+                raise typer.BadParameter(f"{path} (input {role!r}) has changed since {generated.name} was generated",
+                                         param_hint="generated")
+            target = recorded["conform_to"]
+            sources[role] = _conform_clip(path, info, conform_dir / role, log, role, fps=target["fps"],
+                                          size=(target["width"], target["height"]))
+        _, info = next(iter(sources.values()))
+
+        timeline = data["timeline"]
+        fades = _plan_fades(timeline, data["segments"], frames, log)
+
+        def fade_frames(fade: dict, before: bool):
+            start = fade["file_edge"] - fade["frames"] if before else fade["file_edge"]
+            return video.read_frames(generated, start, fade["frames"], made.width, made.height)
+
+        parts = []
+        cursor = 0
+
+        def place(kind: str, n: int, label: str, **details) -> None:
+            nonlocal cursor
+            log.segment(kind, cursor, cursor + n, label, **details)
+            cursor += n
+
+        for entry, (start, end) in zip(timeline, fades):
+            if entry["kind"] == "generated":
+                g0, g1 = entry["file_frames"]
+                parts.append(video.Generated(generated, g0, g1, made.width, made.height))
+                place("generated", g1 - g0, entry["label"], file_frames=[g0, g1])
+                continue
+            role = entry["source"]
+            path, _ = sources[role]
+            a, b = entry["source_frames"]
+            x_start, x_end = (start or {}).get("frames", 0), (end or {}).get("frames", 0)
+            if x_start:
+                parts.append(video.Fade(path, a, fade_frames(start, before=False), fade_in=False))
+                place("crossfade", x_start, f"crossfade out of {start['label']}")
+            parts.append(video.Real(path, a + x_start, b - x_end))
+            place("real", b - x_end - (a + x_start), "clip" if role == "clip" else f"clip {role}",
+                  source=role, source_frames=[a + x_start, b - x_end])
+            if x_end:
+                parts.append(video.Fade(path, b - x_end, fade_frames(end, before=True), fade_in=True))
+                place("crossfade", x_end, f"crossfade into {end['label']}")
+
+        audio = data.get("audio")
+        print(f"Splicing {generated.name} into the footage with {frames}-frame crossfades...")
+        video.assemble(parts, info, output,
+                       audio=(sources[audio["source"]][0], audio["offset_frames"] / info.fps) if audio else None)
+        shutil.rmtree(conform_dir, ignore_errors=True)
+        _print_done(output, None, None, log, info.fps, generated=False)
 
 
 if __name__ == "__main__":
