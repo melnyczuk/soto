@@ -33,13 +33,13 @@ def _bootstrap() -> None:
     # otherwise this CLI's own argv leaks into ComfyUI's parser.
     # --lowvram keeps the UNet's weights off the MPS device except while
     # actually in use.
-    # --cpu-vae works around a real, model-size-independent MPS memory bug in
-    # Wan's causal VAE: measured directly, encoding N frames at 832x480 on
-    # MPS took 2.87GB at N=4, 24.4GB at N=9, and OOM'd (>41GB) at N=17 --
-    # wildly non-linear, not proportional to actual tensor size, so the
-    # causal feat_cache chunking isn't releasing memory between chunks on
-    # this backend. Forcing VAE encode/decode onto CPU sidesteps it; VAE is
-    # cheap relative to the sampling loop, so this is a small wall-clock cost.
+    # The VAE runs where config.VAE_DEVICE says. It used to be forced onto
+    # the CPU (--cpu-vae): encoding N frames at 832x480 on MPS took 2.87GB
+    # at N=4, 24.4GB at N=9 and OOM'd at N=17, which looked like the causal
+    # VAE's chunking not freeing memory between chunks. That was measured
+    # before the torch.inference_mode() fix in run_vace_transition(), and
+    # was the same autograd retention: since the fix it's 5.3GB at N=17 and
+    # 9.6GB at N=81, and 2-3x faster than the CPU at 832x480 (see config.py).
     # --use-pytorch-cross-attention forces PyTorch's native SDPA kernel.
     # Without it, ComfyUI's default attention pick on MPS (no flash-attn/
     # xformers here) fell through to its own `sub_quadratic_attention`
@@ -47,8 +47,13 @@ def _bootstrap() -> None:
     # tiny 192x112x9-frame VACE-conditioned sequence -- never took its
     # chunked code path, materializing a full fp32 attention matrix and
     # hitting the same ~42GB ceiling regardless of UNet size (14B or 1.3B).
+    if config.VAE_DEVICE not in config.VAE_DEVICES:
+        raise RuntimeError(f"SOTO_VAE_DEVICE must be one of {list(config.VAE_DEVICES)}, not {config.VAE_DEVICE!r}")
+    if config.VAE_DTYPE not in config.VAE_DTYPES:
+        raise RuntimeError(f"SOTO_VAE_DTYPE must be one of {list(config.VAE_DTYPES)}, not {config.VAE_DTYPE!r}")
+    vae_args = ["--cpu-vae"] if config.VAE_DEVICE == "cpu" else [f"--{config.VAE_DTYPE}-vae"]
     old_argv, sys.argv = sys.argv, [
-        "comfyui", "--lowvram", "--cpu-vae", "--use-pytorch-cross-attention",
+        "comfyui", "--lowvram", *vae_args, "--use-pytorch-cross-attention",
     ]
     try:
         import comfy.options
@@ -195,6 +200,12 @@ def run_vace_transition(
             latent_image=latent,
             denoise=config.DENOISE,
         )
+
+        # Same again before decoding: with the VAE on the GPU, the UNet would
+        # otherwise still be there, and ComfyUI's estimate of how much room
+        # the decode needs isn't to be trusted on MPS.
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache(force=True)
 
         (images,) = _call(_node_classes["VAEDecode"], vae=vae, samples=samples)
 

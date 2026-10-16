@@ -1,5 +1,6 @@
 """Paths and constants for the soto CLI."""
 
+import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -62,6 +63,25 @@ TEXT_ENCODER_FILENAME = "umt5-xxl-encoder-Q5_K_M.gguf"
 
 VAE_DIR = MODELS_DIR / "vae"
 TEXT_ENCODERS_DIR = MODELS_DIR / "text_encoders"
+
+# Where Wan's VAE encodes and decodes, "gpu" (MPS) or "cpu", and at what
+# precision on the GPU: "bf16", "fp16" or "fp32" (the CPU always uses fp32).
+# The VAE used to be forced onto the CPU after it seemed to leak memory on
+# MPS (24GB at 9 frames, OOM at 17), but that was measured before the
+# torch.inference_mode() fix in comfy_engine.py and was the same autograd
+# retention. Measured since at 832x480: GPU peak 5.3GB at 17 frames, 9.6GB
+# at 81 (the CPU held 15-21GB of RAM doing the same). In a real 33-frame
+# run, encoding went 296s -> 148s and decoding 390s -> 118s on the GPU. At
+# --preview fast's 480x272 the two are about even.
+# fp16 ran no faster than bf16 and matched the CPU's fp32 output more
+# closely (72dB vs 53dB PSNR, both invisible), but bf16 is kept as the
+# default for its fp32-sized range: fp16 is the one that can overflow into
+# NaN/black frames on some VAEs. Override per run with SOTO_VAE_DEVICE /
+# SOTO_VAE_DTYPE.
+VAE_DEVICE = os.environ.get("SOTO_VAE_DEVICE", "gpu")
+VAE_DTYPE = os.environ.get("SOTO_VAE_DTYPE", "bf16")
+VAE_DEVICES = ("gpu", "cpu")
+VAE_DTYPES = ("bf16", "fp16", "fp32")
 
 # pix2pixHD next-frame generators for `soto dream`, as `<name>.pth`. Not
 # downloaded by `soto setup`: they're the generators trained per video in

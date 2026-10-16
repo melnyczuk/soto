@@ -80,6 +80,8 @@ def _log_vace_settings(log: RunLog, *, model: str, prompt: str, steps: int, prev
         "scheduler": config.SCHEDULER,
         "shift": config.MODEL_SHIFT,
         "denoise": config.DENOISE,
+        "vae_device": config.VAE_DEVICE,
+        "vae_dtype": config.VAE_DTYPE if config.VAE_DEVICE == "gpu" else "fp32",
         "context_s": context,
         "crossfade_frames": crossfade,
         "export_generated": str(export_generated.resolve()) if export_generated else None,

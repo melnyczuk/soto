@@ -260,9 +260,22 @@ different model sizes, different vram-mode flags, different attention
 backends -- which is what eventually pointed away from "real GPU memory
 limit" and toward "something retaining references it shouldn't."
 
-`--lowvram`, `--cpu-vae`, and `--use-pytorch-cross-attention` are still forced
-in the bootstrap; they're no longer required to avoid OOM but are cheap
+`--lowvram` and `--use-pytorch-cross-attention` are still forced in the
+bootstrap. They're no longer required to avoid OOM, but they're cheap
 insurance and were left in.
+
+`--cpu-vae` was forced too, after Wan's VAE seemed to leak memory on MPS
+(24GB to encode 9 frames at 832x480, OOM at 17). That was the same missing
+`inference_mode()`. Measured since, the VAE on MPS peaks at 5.3GB for 17
+frames and 9.6GB for 81. Its output matches the CPU's to 53dB PSNR. The
+CPU, oddly, held 15-21GB of RAM doing the same work. So the VAE now runs on
+the GPU in bf16. Each VACE run encodes its whole control video twice and
+decodes the result once. In a real 33-frame run at 832x480, encoding went
+from 296s to 148s and decoding from 390s to 118s: 13 minutes down to under
+6 at one step. That's around 17 minutes saved per 81-frame run. At
+`--preview fast`'s 480x272, the GPU and CPU are about even. Set
+`SOTO_VAE_DEVICE=cpu` to go back, or `SOTO_VAE_DTYPE=fp16`/`fp32` to change
+the GPU precision.
 
 ## Working resolution
 
