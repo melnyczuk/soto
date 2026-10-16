@@ -8,6 +8,7 @@ from pathlib import Path
 import typer
 
 from soto import config
+from soto.metadata import RunLog
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -20,10 +21,19 @@ _EXPORT_HELP = (
     "frames) as a clip on the same timeline as the output, padded with the original footage "
     "wherever there are none -- for laying over the output and fading by hand in an editor."
 )
+_PREVIEW_HELP = (
+    f"Quick low-quality preview: {list(config.PREVIEW_TIERS)}. 'fast' drops the working resolution and steps; "
+    "'draft' only drops steps, so re-running with the same --seed and no --preview gives the same layout."
+)
+_STEPS_HELP = f"Sampling steps (default {config.DEFAULT_STEPS}, or fewer with --preview)."
+_NO_METADATA_HELP = (
+    "Don't write the <output>.json sidecar (settings, seeds, timings and the timeline of real, context "
+    "and generated frames) or embed its chapter markers in the output."
+)
 
 
-def _fit_working_resolution(src_w: int, src_h: int) -> tuple[int, int]:
-    target_area = config.DEFAULT_WIDTH * config.DEFAULT_HEIGHT
+def _fit_working_resolution(src_w: int, src_h: int, area: int | None = None) -> tuple[int, int]:
+    target_area = area or config.DEFAULT_WIDTH * config.DEFAULT_HEIGHT
     aspect = src_w / src_h
     h = (target_area / aspect) ** 0.5
     w = h * aspect
@@ -32,12 +42,76 @@ def _fit_working_resolution(src_w: int, src_h: int) -> tuple[int, int]:
     return int(w), int(h)
 
 
-def _conform_clip(clip: Path, info, tmp_dir: Path, *, fps: float | None = None,
+def _resolve_quality(preview: str | None, steps: int | None, log: RunLog) -> tuple[int | None, int]:
+    """Returns (working area override or None, steps) for --preview; an
+    explicit --steps always wins."""
+    if preview is None:
+        return None, steps if steps is not None else config.DEFAULT_STEPS
+    if preview not in config.PREVIEW_TIERS:
+        raise typer.BadParameter(f"must be one of {list(config.PREVIEW_TIERS)}", param_hint="--preview")
+    area, preview_steps = config.PREVIEW_TIERS[preview]
+    if steps is None:
+        log.adjust("steps", config.DEFAULT_STEPS, preview_steps, f"--preview {preview}")
+    if area is not None:
+        log.adjust("working_area", config.DEFAULT_WIDTH * config.DEFAULT_HEIGHT, area, f"--preview {preview}")
+    return area, steps if steps is not None else preview_steps
+
+
+def _resolve_seed(seed: int | None, log: RunLog) -> int:
+    resolved = seed if seed is not None else random.randint(0, 2**32 - 1)
+    log.settings["seed"] = resolved
+    log.settings["seed_source"] = "given" if seed is not None else "random"
+    return resolved
+
+
+def _log_vace_settings(log: RunLog, *, model: str, prompt: str, steps: int, preview: str | None,
+                       width: int, height: int, context: float, crossfade: int,
+                       export_generated: Path | None) -> None:
+    log.settings.update({
+        "model": model,
+        "checkpoint": config.MODELS[model].filename,
+        "prompt": prompt,
+        "negative_prompt": config.DEFAULT_NEGATIVE_PROMPT,
+        "steps": steps,
+        "preview": preview,
+        "working_resolution": [width, height],
+        "cfg": config.CFG,
+        "sampler": config.SAMPLER_NAME,
+        "scheduler": config.SCHEDULER,
+        "shift": config.MODEL_SHIFT,
+        "denoise": config.DENOISE,
+        "context_s": context,
+        "crossfade_frames": crossfade,
+        "export_generated": str(export_generated.resolve()) if export_generated else None,
+    })
+
+
+def _context_reason(want: int, available: int, used: int) -> str:
+    reasons = []
+    if available < want:
+        reasons.append(f"only {available} real frames available")
+    if used != min(want, available):
+        reasons.append(f"nudged so the VACE length fits its stride of {config.VACE_LENGTH_STRIDE}")
+    return "; ".join(reasons)
+
+
+def _preview_note(preview: str | None) -> str:
+    return f" (preview: {preview})" if preview else ""
+
+
+def _print_done(output: Path, seed: int, preview: str | None, log: RunLog, fps: float) -> None:
+    log.write(output, fps)
+    print(f"Done: {output} (seed={seed})")
+    if preview:
+        print(f"Preview only -- re-run without --preview and with --seed {seed} for the full-quality version.")
+
+
+def _conform_clip(clip: Path, info, tmp_dir: Path, log: RunLog, role: str, *, fps: float | None = None,
                   size: tuple[int, int] | None = None):
     """Returns (clip, info), re-encoded into `tmp_dir` only if the clip
     doesn't already match `fps` and `size`. `size` defaults to the clip's own,
     rounded down to even, since every segment is re-encoded as yuv420p
-    and that needs even dimensions."""
+    and that needs even dimensions. Logs the clip as an input named `role`."""
     from soto import video
 
     fps = fps if fps is not None else info.fps
@@ -47,6 +121,7 @@ def _conform_clip(clip: Path, info, tmp_dir: Path, *, fps: float | None = None,
         changes.append(f"fps {info.fps:.3f} -> {fps:.3f}")
     if (info.width, info.height) != (width, height):
         changes.append(f"size {info.width}x{info.height} -> {width}x{height}")
+    log.input(role, clip, info, changes)
     if not changes:
         return clip, info
     print(f"  conforming {clip.name} ({', '.join(changes)})...")
@@ -204,86 +279,115 @@ def transition(
         help=f"Which checkpoint to use: {list(config.MODELS)}.",
     ),
     prompt: str = typer.Option(config.DEFAULT_PROMPT, "--prompt", help="Positive prompt guiding the transition."),
-    steps: int = typer.Option(config.DEFAULT_STEPS, "--steps", help="Sampling steps."),
+    steps: int = typer.Option(None, "--steps", help=_STEPS_HELP),
+    preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
     seed: int = typer.Option(None, "--seed", help="Random seed (default: random each run)."),
     crossfade: int = typer.Option(0, "--crossfade", min=0, help=_CROSSFADE_HELP),
     export_generated: Path = typer.Option(None, "--export-generated", dir_okay=False, help=_EXPORT_HELP),
+    no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
 ) -> None:
     """Generate an AI-blended transition between two clips and splice it in."""
     if model not in config.MODELS:
         raise typer.BadParameter(f"--model must be one of {list(config.MODELS)}")
+    log = RunLog("transition", enabled=not no_metadata)
+    with log.guard(output):
+        area, steps = _resolve_quality(preview, steps, log)
 
-    from soto import video
+        from soto import video
 
-    print(f"Probing {clip_a} and {clip_b}...")
-    info_a = video.probe(clip_a)
-    info_b = video.probe(clip_b)
+        print(f"Probing {clip_a} and {clip_b}...")
+        info_a = video.probe(clip_a)
+        info_b = video.probe(clip_b)
 
-    # Clip B is conformed to clip A's frame rate and size, so the two can be
-    # cut together into one stream.
-    conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
-    clip_a, info_a = _conform_clip(clip_a, info_a, conform_dir / "a")
-    clip_b, info_b = _conform_clip(
-        clip_b, info_b, conform_dir / "b", fps=info_a.fps, size=(info_a.width, info_a.height)
-    )
+        # Clip B is conformed to clip A's frame rate and size, so the two can be
+        # cut together into one stream.
+        conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
+        clip_a, info_a = _conform_clip(clip_a, info_a, conform_dir / "a", log, "a")
+        clip_b, info_b = _conform_clip(
+            clip_b, info_b, conform_dir / "b", log, "b", fps=info_a.fps, size=(info_a.width, info_a.height)
+        )
 
-    fps = info_a.fps
-    context_frames = max(1, round(context * fps))
-    gap_frames = max(1, round(duration * fps))
-    length = 2 * context_frames + gap_frames
-    # Wan's causal VAE has temporal stride 4 (+1 for the leading frame), so
-    # length % 4 == 1 is the well-formed frame count -- round the gap up to it.
-    remainder = (length - 1) % config.VACE_LENGTH_STRIDE
-    if remainder != 0:
-        gap_frames += config.VACE_LENGTH_STRIDE - remainder
+        fps = info_a.fps
+        context_frames = max(1, round(context * fps))
+        gap_frames = requested_gap = max(1, round(duration * fps))
         length = 2 * context_frames + gap_frames
+        # Wan's causal VAE has temporal stride 4 (+1 for the leading frame), so
+        # length % 4 == 1 is the well-formed frame count -- round the gap up to it.
+        remainder = (length - 1) % config.VACE_LENGTH_STRIDE
+        if remainder != 0:
+            gap_frames += config.VACE_LENGTH_STRIDE - remainder
+            length = 2 * context_frames + gap_frames
+            log.adjust("gap_frames", requested_gap, gap_frames,
+                       f"rounded up so the VACE length fits its stride of {config.VACE_LENGTH_STRIDE}")
 
-    width, height = _fit_working_resolution(info_a.width, info_a.height)
-    print(f"  working resolution {width}x{height}, {context_frames} context frames/side, {gap_frames} gap frames")
+        width, height = _fit_working_resolution(info_a.width, info_a.height, area)
+        _log_vace_settings(log, model=model, prompt=prompt, steps=steps, preview=preview, width=width, height=height,
+                           context=context, crossfade=crossfade, export_generated=export_generated)
+        log.settings.update({"duration_s": duration, "gap_frames": gap_frames, "context_frames": context_frames})
+        print(f"  working resolution {width}x{height}{_preview_note(preview)}, "
+              f"{context_frames} context frames/side, {gap_frames} gap frames")
 
-    print("Extracting context frames...")
-    context_a = video.extract_tail_context(clip_a, info_a, context_frames, width, height)
-    context_b = video.extract_head_context(clip_b, info_b, context_frames, width, height)
-    max_crossfade = min(context_a.shape[0], context_b.shape[0])
-    if crossfade > max_crossfade:
-        raise typer.BadParameter(
-            f"can't exceed the {max_crossfade} context frames per side", param_hint="--crossfade"
+        print("Extracting context frames...")
+        context_a = video.extract_tail_context(clip_a, info_a, context_frames, width, height)
+        context_b = video.extract_head_context(clip_b, info_b, context_frames, width, height)
+        n_a, n_b = context_a.shape[0], context_b.shape[0]
+        for side, n in (("a", n_a), ("b", n_b)):
+            if n < context_frames:
+                log.adjust(f"context_frames_{side}", context_frames, n, f"clip {side} only has {n} frames")
+        max_crossfade = min(n_a, n_b)
+        if crossfade > max_crossfade:
+            raise typer.BadParameter(
+                f"can't exceed the {max_crossfade} context frames per side", param_hint="--crossfade"
+            )
+
+        resolved_seed = _resolve_seed(seed, log)
+        print(f"Running Wan2.1-VACE ({model}) transition (seed={resolved_seed}, steps={steps})...")
+        with log.run(seed=resolved_seed, steps=steps, context_frames_before=n_a, gap_frames=gap_frames,
+                     context_frames_after=n_b,
+                     context_source_before={"clip": "a", "frames": [info_a.n_frames - n_a, info_a.n_frames]},
+                     context_source_after={"clip": "b", "frames": [0, n_b]}):
+            result = _run_vace(context_a, context_b, gap_frames, width, height, model, prompt, steps, resolved_seed)
+        if export_generated is not None:
+            print(f"Exporting generated frames to {export_generated}...")
+            video.export_generated(
+                [
+                    (clip_a, 0, info_a.n_frames - context_a.shape[0]),
+                    result.frames.cpu().numpy(),
+                    (clip_b, context_b.shape[0], info_b.n_frames),
+                ],
+                info_a,
+                export_generated,
+            )
+
+        print("Splicing final output...")
+        tmp_dir = Path(tempfile.mkdtemp(prefix="soto-splice-"))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        video.splice_output(
+            clip_a=clip_a,
+            clip_b=clip_b,
+            info_a=info_a,
+            info_b=info_b,
+            generated_frames=result.frames,
+            context_frames_a=context_a.shape[0],
+            gap_frames=gap_frames,
+            context_frames_b=context_b.shape[0],
+            crossfade=crossfade,
+            output_path=output,
+            tmp_dir=tmp_dir,
         )
-
-    resolved_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
-    print(f"Running Wan2.1-VACE ({model}) transition (seed={resolved_seed}, steps={steps})...")
-    result = _run_vace(context_a, context_b, gap_frames, width, height, model, prompt, steps, resolved_seed)
-    if export_generated is not None:
-        print(f"Exporting generated frames to {export_generated}...")
-        video.export_generated(
-            [
-                (clip_a, 0, info_a.n_frames - context_a.shape[0]),
-                result.frames.cpu().numpy(),
-                (clip_b, context_b.shape[0], info_b.n_frames),
-            ],
-            info_a,
-            export_generated,
-        )
-
-    print("Splicing final output...")
-    tmp_dir = Path(tempfile.mkdtemp(prefix="soto-splice-"))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    video.splice_output(
-        clip_a=clip_a,
-        clip_b=clip_b,
-        info_a=info_a,
-        info_b=info_b,
-        generated_frames=result.frames,
-        context_frames_a=context_a.shape[0],
-        gap_frames=gap_frames,
-        context_frames_b=context_b.shape[0],
-        crossfade=crossfade,
-        output_path=output,
-        tmp_dir=tmp_dir,
-    )
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    shutil.rmtree(conform_dir, ignore_errors=True)
-    print(f"Done: {output}")
+        # Output timeline: all of clip A, the gap, then all of clip B.
+        gap_start, gap_end = info_a.n_frames, info_a.n_frames + gap_frames
+        log.segment("real", 0, gap_start - crossfade, "clip a", source="a", source_frames=[0, gap_start - crossfade])
+        log.segment("crossfade", gap_start - crossfade, gap_start, "crossfade out of clip a", run=1)
+        log.segment("generated", gap_start, gap_end, f"generated (seed {resolved_seed})", run=1)
+        log.segment("crossfade", gap_end, gap_end + crossfade, "crossfade into clip b", run=1)
+        log.segment("real", gap_end + crossfade, gap_end + info_b.n_frames, "clip b",
+                    source="b", source_frames=[crossfade, info_b.n_frames])
+        log.segment("context", gap_start - n_a, gap_start, "context from clip a", run=1)
+        log.segment("context", gap_end, gap_end + n_b, "context from clip b", run=1)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(conform_dir, ignore_errors=True)
+        _print_done(output, resolved_seed, preview, log, fps)
 
 
 @app.command()
@@ -303,199 +407,345 @@ def bridge(
         help=f"Which checkpoint to use: {list(config.MODELS)}.",
     ),
     prompt: str = typer.Option(config.DEFAULT_PROMPT, "--prompt", help="Positive prompt guiding the generated frames."),
-    steps: int = typer.Option(config.DEFAULT_STEPS, "--steps", help="Sampling steps."),
+    steps: int = typer.Option(None, "--steps", help=_STEPS_HELP),
+    preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
     seed: int = typer.Option(None, "--seed", help="Random seed (default: random each run)."),
     crossfade: int = typer.Option(0, "--crossfade", min=0, help=_CROSSFADE_HELP),
     export_generated: Path = typer.Option(None, "--export-generated", dir_okay=False, help=_EXPORT_HELP),
+    no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
 ) -> None:
     """Find blank intervals inside a clip and replace each with a generated bridge."""
     if model not in config.MODELS:
         raise typer.BadParameter(f"--model must be one of {list(config.MODELS)}")
+    log = RunLog("bridge", enabled=not no_metadata)
+    with log.guard(output):
+        area, steps = _resolve_quality(preview, steps, log)
+        from soto import video
+
+        try:
+            rgb = video.parse_hex_color(color)
+        except ValueError as e:
+            raise typer.BadParameter(str(e), param_hint="--color") from None
+
+        print(f"Probing {clip}...")
+        info = video.probe(clip)
+        conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
+        clip, info = _conform_clip(clip, info, conform_dir, log, "clip")
+        fps = info.fps
+
+        print(f"Scanning for blank frames matching {color} (tolerance {tolerance})...")
+        intervals = video.detect_flat_intervals(clip, rgb, tolerance)
+        max_gap_frames = round(max_gap * fps)
+        context_frames = max(1, round(context * fps))
+        width, height = _fit_working_resolution(info.width, info.height, area)
+        _log_vace_settings(log, model=model, prompt=prompt, steps=steps, preview=preview, width=width, height=height,
+                           context=context, crossfade=crossfade, export_generated=export_generated)
+        log.settings.update({"color": color, "tolerance": tolerance, "max_gap_s": max_gap,
+                             "context_frames": context_frames})
+
+        plans: list[tuple[int, int, int, int]] = []
+        for i, (start, end) in enumerate(intervals):
+            span = f"frames {start}-{end - 1} ({(end - start) / fps:.2f}s)"
+            blank = {"start_frame": start, "end_frame": end, "seconds": round((end - start) / fps, 3)}
+            if start == 0 or end == info.n_frames:
+                print(f"  skip {span}: touches the clip edge")
+                log.append("blank_intervals", {**blank, "outcome": "skipped", "reason": "touches the clip edge"})
+                continue
+            if end - start > max_gap_frames:
+                print(f"  skip {span}: longer than --max-gap {max_gap}s")
+                log.append("blank_intervals", {**blank, "outcome": "skipped",
+                                               "reason": f"longer than --max-gap {max_gap}s"})
+                continue
+            # Context can't reach into a neighbouring blank, bridged or not.
+            lo = intervals[i - 1][1] if i > 0 else 0
+            hi = intervals[i + 1][0] if i + 1 < len(intervals) else info.n_frames
+            planned = _plan_context(start, end, lo, hi, context_frames)
+            if planned is None:
+                print(f"  skip {span}: not enough real footage around it for context")
+                log.append("blank_intervals", {**blank, "outcome": "skipped",
+                                               "reason": "not enough real footage around it for context"})
+                continue
+            n_a, n_b = planned
+            print(f"  bridge {span} with {n_a}+{n_b} context frames")
+            log.append("blank_intervals", {**blank, "outcome": "bridged",
+                                           "context_frames_before": n_a, "context_frames_after": n_b})
+            for side, used, available in (("before", n_a, start - lo), ("after", n_b, hi - end)):
+                if used != context_frames:
+                    log.adjust(f"context_frames_{side} (frames {start}-{end - 1})", context_frames, used,
+                               _context_reason(context_frames, available, used))
+            plans.append((start, end, n_a, n_b))
+
+        if not plans:
+            shutil.rmtree(conform_dir, ignore_errors=True)
+            print("Nothing to bridge; no output written.")
+            return
+
+        # Crossfades come out of each side's context, and two neighbouring
+        # bridges can't both fade over the same real frames, so split any shared
+        # stretch of real footage between them.
+        fades = [[min(crossfade, n_a), min(crossfade, n_b)] for _, _, n_a, n_b in plans]
+        for (_, prev_end, _, _), (start, _, _, _), prev, cur in zip(plans, plans[1:], fades, fades[1:]):
+            real = start - prev_end
+            if prev[1] + cur[0] > real:
+                prev[1] = min(prev[1], real // 2)
+                cur[0] = min(cur[0], real - prev[1])
+        if crossfade:
+            for (start, end, n_a, n_b), (x_a, x_b) in zip(plans, fades):
+                for side, used, n in (("before", x_a, n_a), ("after", x_b, n_b)):
+                    if used < crossfade:
+                        reason = (f"limited to the {n} context frames" if used == n
+                                  else "split with the neighbouring bridge's fade over shared real footage")
+                        log.adjust(f"crossfade_{side} (frames {start}-{end - 1})", crossfade, used, reason)
+
+        resolved_seed = _resolve_seed(seed, log)
+        print(f"Working resolution {width}x{height}{_preview_note(preview)}, seed={resolved_seed}, steps={steps}")
+        fills = []
+        decoded_runs = []
+        for k, ((start, end, n_a, n_b), (x_a, x_b)) in enumerate(zip(plans, fades), 1):
+            fade_note = f" with {x_a}+{x_b} crossfade frames" if crossfade else ""
+            print(f"[{k}/{len(plans)}] Running Wan2.1-VACE ({model}) for frames {start}-{end - 1}{fade_note}...")
+            context_a = video.read_frames(clip, start - n_a, n_a, width, height)
+            context_b = video.read_frames(clip, end, n_b, width, height)
+            with log.run(seed=resolved_seed, steps=steps, context_frames_before=n_a, gap_frames=end - start,
+                         context_frames_after=n_b, gap=[start, end], crossfade=[x_a, x_b]):
+                result = _run_vace(
+                    context_a, context_b, end - start, width, height, model, prompt, steps, resolved_seed
+                )
+            if export_generated is not None:
+                decoded_runs.append((start - n_a, end + n_b, result.frames.cpu().numpy()))
+            gap_end = n_a + (end - start)
+            fills.append((
+                start,
+                end,
+                result.frames[n_a:gap_end].cpu().numpy(),
+                result.frames[n_a - x_a:n_a].cpu().numpy(),
+                result.frames[gap_end:gap_end + x_b].cpu().numpy(),
+            ))
+
+        print("Splicing final output...")
+        tmp_dir = Path(tempfile.mkdtemp(prefix="soto-bridge-"))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        video.splice_fills(clip=clip, info=info, fills=fills, output_path=output, tmp_dir=tmp_dir)
+        if export_generated is not None:
+            # Neighbouring runs' context can overlap; where it does, the earlier
+            # run's trailing frames give way to the later run's leading ones.
+            parts = []
+            cursor = 0
+            for i, (run_start, run_end, decoded) in enumerate(decoded_runs):
+                parts.append((clip, cursor, run_start))
+                next_start = decoded_runs[i + 1][0] if i + 1 < len(decoded_runs) else run_end
+                parts.append(decoded[:min(run_end, next_start) - run_start])
+                cursor = min(run_end, next_start)
+            parts.append((clip, cursor, info.n_frames))
+            print(f"Exporting generated frames to {export_generated}...")
+            video.export_generated(parts, info, export_generated, audio_source=clip)
+        # Bridging keeps every frame where it was, so output frames are input frames.
+        cursor = 0
+        for k, ((start, end, n_a, n_b), (x_a, x_b)) in enumerate(zip(plans, fades), 1):
+            log.segment("real", cursor, start - x_a, "clip", source="clip", source_frames=[cursor, start - x_a])
+            log.segment("crossfade", start - x_a, start, f"crossfade into bridge {k}", run=k)
+            log.segment("generated", start, end, f"bridge {k} (seed {resolved_seed})", run=k)
+            log.segment("crossfade", end, end + x_b, f"crossfade out of bridge {k}", run=k)
+            log.segment("context", start - n_a, start, f"context before bridge {k}", run=k)
+            log.segment("context", end, end + n_b, f"context after bridge {k}", run=k)
+            cursor = end + x_b
+        log.segment("real", cursor, info.n_frames, "clip", source="clip", source_frames=[cursor, info.n_frames])
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(conform_dir, ignore_errors=True)
+        _print_done(output, resolved_seed, preview, log, fps)
+
+
+_EXTEND_SIDES = ("start", "end", "bookend")
+
+
+def _extend_side(clip: Path, info, n_ctx: int, frames: int, iterations: int, width: int, height: int,
+                 model: str, prompt: str, steps: int, seed: int, log: RunLog, *, at_start: bool):
+    """Runs `extend`'s iterations off one end of the clip. Returns (chunks,
+    regenerated): the new frames in time order, and VACE's decoded version
+    of the n_ctx real frames at that end, for the crossfade."""
+    import numpy as np
+
     from soto import video
 
-    try:
-        rgb = video.parse_hex_color(color)
-    except ValueError as e:
-        raise typer.BadParameter(str(e), param_hint="--color") from None
+    # Context for every iteration after the first comes from generated frames,
+    # kept at working resolution so nothing goes through a lossy re-encode
+    # between iterations.
+    if at_start:
+        history = video.extract_head_context(clip, info, n_ctx, width, height)
+    else:
+        history = video.extract_tail_context(clip, info, n_ctx, width, height)
+    empty = np.zeros((0, height, width, 3), dtype=np.float32)
+    label = "start" if at_start else "end"
 
-    print(f"Probing {clip}...")
-    info = video.probe(clip)
-    conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
-    clip, info = _conform_clip(clip, info, conform_dir)
-    fps = info.fps
-
-    print(f"Scanning for blank frames matching {color} (tolerance {tolerance})...")
-    intervals = video.detect_flat_intervals(clip, rgb, tolerance)
-    max_gap_frames = round(max_gap * fps)
-    context_frames = max(1, round(context * fps))
-    width, height = _fit_working_resolution(info.width, info.height)
-
-    plans: list[tuple[int, int, int, int]] = []
-    for i, (start, end) in enumerate(intervals):
-        span = f"frames {start}-{end - 1} ({(end - start) / fps:.2f}s)"
-        if start == 0 or end == info.n_frames:
-            print(f"  skip {span}: touches the clip edge")
-            continue
-        if end - start > max_gap_frames:
-            print(f"  skip {span}: longer than --max-gap {max_gap}s")
-            continue
-        # Context can't reach into a neighbouring blank, bridged or not.
-        lo = intervals[i - 1][1] if i > 0 else 0
-        hi = intervals[i + 1][0] if i + 1 < len(intervals) else info.n_frames
-        planned = _plan_context(start, end, lo, hi, context_frames)
-        if planned is None:
-            print(f"  skip {span}: not enough real footage around it for context")
-            continue
-        n_a, n_b = planned
-        print(f"  bridge {span} with {n_a}+{n_b} context frames")
-        plans.append((start, end, n_a, n_b))
-
-    if not plans:
-        shutil.rmtree(conform_dir, ignore_errors=True)
-        print("Nothing to bridge; no output written.")
-        return
-
-    # Crossfades come out of each side's context, and two neighbouring
-    # bridges can't both fade over the same real frames, so split any shared
-    # stretch of real footage between them.
-    fades = [[min(crossfade, n_a), min(crossfade, n_b)] for _, _, n_a, n_b in plans]
-    for (_, prev_end, _, _), (start, _, _, _), prev, cur in zip(plans, plans[1:], fades, fades[1:]):
-        real = start - prev_end
-        if prev[1] + cur[0] > real:
-            prev[1] = min(prev[1], real // 2)
-            cur[0] = min(cur[0], real - prev[1])
-
-    resolved_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
-    print(f"Working resolution {width}x{height}, seed={resolved_seed}, steps={steps}")
-    fills = []
-    decoded_runs = []
-    for k, ((start, end, n_a, n_b), (x_a, x_b)) in enumerate(zip(plans, fades), 1):
-        fade_note = f" with {x_a}+{x_b} crossfade frames" if crossfade else ""
-        print(f"[{k}/{len(plans)}] Running Wan2.1-VACE ({model}) for frames {start}-{end - 1}{fade_note}...")
-        context_a = video.read_frames(clip, start - n_a, n_a, width, height)
-        context_b = video.read_frames(clip, end, n_b, width, height)
-        result = _run_vace(context_a, context_b, end - start, width, height, model, prompt, steps, resolved_seed)
-        if export_generated is not None:
-            decoded_runs.append((start - n_a, end + n_b, result.frames.cpu().numpy()))
-        gap_end = n_a + (end - start)
-        fills.append((
-            start,
-            end,
-            result.frames[n_a:gap_end].cpu().numpy(),
-            result.frames[n_a - x_a:n_a].cpu().numpy(),
-            result.frames[gap_end:gap_end + x_b].cpu().numpy(),
-        ))
-
-    print("Splicing final output...")
-    tmp_dir = Path(tempfile.mkdtemp(prefix="soto-bridge-"))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    video.splice_fills(clip=clip, info=info, fills=fills, output_path=output, tmp_dir=tmp_dir)
-    if export_generated is not None:
-        # Neighbouring runs' context can overlap; where it does, the earlier
-        # run's trailing frames give way to the later run's leading ones.
-        parts = []
-        cursor = 0
-        for i, (run_start, run_end, decoded) in enumerate(decoded_runs):
-            parts.append((clip, cursor, run_start))
-            next_start = decoded_runs[i + 1][0] if i + 1 < len(decoded_runs) else run_end
-            parts.append(decoded[:min(run_end, next_start) - run_start])
-            cursor = min(run_end, next_start)
-        parts.append((clip, cursor, info.n_frames))
-        print(f"Exporting generated frames to {export_generated}...")
-        video.export_generated(parts, info, export_generated, audio_source=clip)
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    shutil.rmtree(conform_dir, ignore_errors=True)
-    print(f"Done: {output}")
+    chunks = []
+    for i in range(iterations):
+        print(f"[{i + 1}/{iterations} {label}] Running Wan2.1-VACE ({model}) for {frames} frames...")
+        # Vary the seed per iteration so successive extensions don't reuse the
+        # same noise and settle into repeating motion.
+        iter_seed = (seed + i) % 2**32
+        run = log.run(side=label, iteration=i + 1, seed=iter_seed, steps=steps, context_frames=n_ctx,
+                      gap_frames=frames, context_source="clip" if i == 0 else "generated + clip")
+        if at_start:
+            context = history[:n_ctx]
+            with run:
+                result = _run_vace(empty, context, frames, width, height, model, prompt, steps, iter_seed)
+            chunk = result.frames[:frames].cpu().numpy()
+            if i == 0:
+                # Later iterations only ever join generated frames to generated
+                # frames, so the first seam is the only one with real footage.
+                regenerated = result.frames[frames:].cpu().numpy()
+            history = np.concatenate([chunk, context], axis=0)
+        else:
+            context = history[-n_ctx:]
+            with run:
+                result = _run_vace(context, empty, frames, width, height, model, prompt, steps, iter_seed)
+            chunk = result.frames[n_ctx:n_ctx + frames].cpu().numpy()
+            if i == 0:
+                regenerated = result.frames[:n_ctx].cpu().numpy()
+            history = np.concatenate([context, chunk], axis=0)
+        chunks.append(chunk)
+    # Extending backwards produces each chunk earlier in time than the last.
+    return (chunks[::-1] if at_start else chunks), regenerated
 
 
 @app.command()
 def extend(
-    clip: Path = typer.Argument(..., exists=True, help="Clip to extend past its last frame."),
+    clip: Path = typer.Argument(..., exists=True, help="Clip to extend before its first frame and/or past its last."),
     output: Path = typer.Option(..., "-o", "--output", help="Output video path."),
-    frames: int = typer.Option(..., "--frames", min=1, help="Frames to generate per iteration."),
+    frames: int = typer.Option(..., "--frames", min=1, help="Frames to generate per iteration, per side."),
     iterations: int = typer.Option(
         1, "--iterations", min=1,
-        help="How many times to extend; each iteration continues from the previous one's result.",
+        help="How many times to extend each side; each iteration continues from the previous one's result.",
+    ),
+    side: str = typer.Option(
+        "end", "--side",
+        help=f"Which end to extend: {list(_EXTEND_SIDES)}. 'bookend' does both.",
     ),
     context: float = typer.Option(
-        config.DEFAULT_CONTEXT_S, "--context", help="Seconds of context taken from the end of the clip."
+        config.DEFAULT_CONTEXT_S, "--context", help="Seconds of context taken from each extended end of the clip."
     ),
     model: str = typer.Option(
         config.DEFAULT_MODEL, "--model",
         help=f"Which checkpoint to use: {list(config.MODELS)}.",
     ),
     prompt: str = typer.Option(config.DEFAULT_PROMPT, "--prompt", help="Positive prompt guiding the generated frames."),
-    steps: int = typer.Option(config.DEFAULT_STEPS, "--steps", help="Sampling steps."),
+    steps: int = typer.Option(None, "--steps", help=_STEPS_HELP),
+    preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
     seed: int = typer.Option(None, "--seed", help="Random seed (default: random each run)."),
     crossfade: int = typer.Option(0, "--crossfade", min=0, help=_CROSSFADE_HELP),
     export_generated: Path = typer.Option(None, "--export-generated", dir_okay=False, help=_EXPORT_HELP),
+    no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
 ) -> None:
-    """Generate new frames continuing on from the end of a clip, optionally
-    several times over, and append them."""
+    """Generate new frames leading into the start of a clip, continuing on
+    from its end, or both, optionally several times over, and add them."""
     if model not in config.MODELS:
         raise typer.BadParameter(f"--model must be one of {list(config.MODELS)}")
+    if side not in _EXTEND_SIDES:
+        raise typer.BadParameter(f"must be one of {list(_EXTEND_SIDES)}", param_hint="--side")
+    log = RunLog("extend", enabled=not no_metadata)
+    with log.guard(output):
+        area, steps = _resolve_quality(preview, steps, log)
+        do_start, do_end = side in ("start", "bookend"), side in ("end", "bookend")
 
-    import numpy as np
+        import numpy as np
 
-    from soto import video
+        from soto import video
 
-    print(f"Probing {clip}...")
-    info = video.probe(clip)
-    conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
-    clip, info = _conform_clip(clip, info, conform_dir)
-    fps = info.fps
-    width, height = _fit_working_resolution(info.width, info.height)
+        print(f"Probing {clip}...")
+        info = video.probe(clip)
+        conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
+        clip, info = _conform_clip(clip, info, conform_dir, log, "clip")
+        fps = info.fps
+        width, height = _fit_working_resolution(info.width, info.height, area)
 
-    # Later iterations take context from a history that's only ever longer
-    # than the original clip, so the count planned here works for all of them.
-    n_ctx = _plan_extend_context(frames, info.n_frames, max(1, round(context * fps)))
-    if n_ctx is None:
-        raise typer.BadParameter(f"{clip} is too short to take context from", param_hint="clip")
-    if crossfade > n_ctx:
-        raise typer.BadParameter(f"can't exceed the {n_ctx} context frames", param_hint="--crossfade")
-    total = frames * iterations
-    print(f"  working resolution {width}x{height}, {n_ctx} context frames, "
-          f"{iterations} x {frames} new frames ({total / fps:.2f}s)")
+        # Later iterations take context from a history that's only ever longer
+        # than the original clip, so the count planned here works for all of them.
+        want_ctx = max(1, round(context * fps))
+        n_ctx = _plan_extend_context(frames, info.n_frames, want_ctx)
+        if n_ctx is None:
+            raise typer.BadParameter(f"{clip} is too short to take context from", param_hint="clip")
+        if n_ctx != want_ctx:
+            log.adjust("context_frames", want_ctx, n_ctx, _context_reason(want_ctx, info.n_frames, n_ctx))
+        if crossfade > n_ctx:
+            raise typer.BadParameter(f"can't exceed the {n_ctx} context frames", param_hint="--crossfade")
+        if do_start and do_end and 2 * crossfade > info.n_frames:
+            raise typer.BadParameter(
+                f"the fades at both ends can't overlap: at most {info.n_frames // 2} for this clip",
+                param_hint="--crossfade",
+            )
+        total = frames * iterations
+        print(f"  working resolution {width}x{height}{_preview_note(preview)}, {n_ctx} context frames, "
+              f"{iterations} x {frames} new frames ({total / fps:.2f}s) at the {side}")
 
-    # Context for every iteration after the first comes from generated frames,
-    # kept at working resolution so nothing goes through a lossy re-encode
-    # between iterations.
-    history = video.extract_tail_context(clip, info, n_ctx, width, height)
-    empty = np.zeros((0, height, width, 3), dtype=np.float32)
-    resolved_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
-    print(f"seed={resolved_seed}, steps={steps}")
+        _log_vace_settings(log, model=model, prompt=prompt, steps=steps, preview=preview, width=width, height=height,
+                           context=context, crossfade=crossfade, export_generated=export_generated)
+        log.settings.update({"side": side, "frames": frames, "iterations": iterations, "context_frames": n_ctx})
+        resolved_seed = _resolve_seed(seed, log)
+        log.settings["seed_note"] = "iteration i (from 0) on each side uses seed + i"
+        print(f"seed={resolved_seed}, steps={steps}")
+        # Both sides use the same seeds, so `--side start` with a bookend run's
+        # seed reproduces its start.
+        args = (clip, info, n_ctx, frames, iterations, width, height, model, prompt, steps, resolved_seed, log)
+        head, head_regen = _extend_side(*args, at_start=True) if do_start else ([], None)
+        tail, tail_regen = _extend_side(*args, at_start=False) if do_end else ([], None)
 
-    generated = []
-    for i in range(iterations):
-        print(f"[{i + 1}/{iterations}] Running Wan2.1-VACE ({model}) for {frames} frames...")
-        context_a = history[-n_ctx:]
-        # Vary the seed per iteration so successive extensions don't reuse the
-        # same noise and settle into repeating motion.
-        iter_seed = (resolved_seed + i) % 2**32
-        result = _run_vace(context_a, empty, frames, width, height, model, prompt, steps, iter_seed)
-        chunk = result.frames[n_ctx:n_ctx + frames].cpu().numpy()
-        if i == 0:
-            # Later iterations only ever join generated frames to generated
-            # frames, so the first seam is the only one with real footage.
-            regenerated = result.frames[:n_ctx].cpu().numpy()
-        generated.append(chunk)
-        history = np.concatenate([context_a, chunk], axis=0)
-
-    print("Splicing final output...")
-    tmp_dir = Path(tempfile.mkdtemp(prefix="soto-extend-"))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    video.append_frames(
-        clip=clip, info=info, frames=np.concatenate(generated, axis=0),
-        lead_in=regenerated[n_ctx - crossfade:], output_path=output, tmp_dir=tmp_dir,
-    )
-    if export_generated is not None:
-        print(f"Exporting generated frames to {export_generated}...")
-        video.export_generated(
-            [(clip, 0, info.n_frames - n_ctx), regenerated, *generated], info, export_generated, audio_source=clip
+        print("Splicing final output...")
+        tmp_dir = Path(tempfile.mkdtemp(prefix="soto-extend-"))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        empty = np.zeros((0, height, width, 3), dtype=np.float32)
+        video.extend_frames(
+            clip=clip,
+            info=info,
+            head=np.concatenate(head, axis=0) if head else None,
+            head_fade=head_regen[:crossfade] if do_start else empty,
+            tail=np.concatenate(tail, axis=0) if tail else None,
+            tail_fade=tail_regen[n_ctx - crossfade:] if do_end else empty,
+            output_path=output,
+            tmp_dir=tmp_dir,
         )
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    shutil.rmtree(conform_dir, ignore_errors=True)
-    print(f"Done: {output}")
+        if export_generated is not None:
+            # On a clip shorter than both contexts together, the regenerated
+            # start and end overlap; the end's frames win there.
+            head_ctx = min(n_ctx, info.n_frames - n_ctx) if do_start and do_end else n_ctx
+            real_start = head_ctx if do_start else 0
+            real_end = info.n_frames - n_ctx if do_end else info.n_frames
+            print(f"Exporting generated frames to {export_generated}...")
+            video.export_generated(
+                [
+                    *head,
+                    *([head_regen[:head_ctx]] if do_start else []),
+                    (clip, real_start, real_end),
+                    *([tail_regen] if do_end else []),
+                    *tail,
+                ],
+                info,
+                export_generated,
+                audio_source=clip,
+                audio_offset_s=total / fps if do_start else 0.0,
+            )
+        # Output timeline: [new head] + clip + [new tail]. Each iteration's
+        # context is the n_ctx frames next to its new frames, real or generated.
+        clip_start = total if do_start else 0
+        clip_end = clip_start + info.n_frames
+        x_head, x_tail = (crossfade if do_start else 0), (crossfade if do_end else 0)
+        for i in range(iterations if do_start else 0):
+            g = clip_start - (i + 1) * frames
+            log.segment("generated", g, g + frames, f"start, iteration {i + 1} (seed {(resolved_seed + i) % 2**32})",
+                        side="start", iteration=i + 1)
+            log.segment("context", g + frames, g + frames + n_ctx, f"context for start iteration {i + 1}",
+                        side="start", iteration=i + 1)
+        log.segment("crossfade", clip_start, clip_start + x_head, "crossfade into clip", side="start")
+        log.segment("real", clip_start + x_head, clip_end - x_tail, "clip",
+                    source="clip", source_frames=[x_head, info.n_frames - x_tail])
+        log.segment("crossfade", clip_end - x_tail, clip_end, "crossfade out of clip", side="end")
+        for i in range(iterations if do_end else 0):
+            g = clip_end + i * frames
+            log.segment("generated", g, g + frames, f"end, iteration {i + 1} (seed {(resolved_seed + i) % 2**32})",
+                        side="end", iteration=i + 1)
+            log.segment("context", g - n_ctx, g, f"context for end iteration {i + 1}", side="end", iteration=i + 1)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(conform_dir, ignore_errors=True)
+        _print_done(output, resolved_seed, preview, log, fps)
 
 
 def _resolve_checkpoint(checkpoint: str) -> Path:
@@ -539,6 +789,7 @@ def dream(
         help="Pixels per frame the camera drifts toward the brightest quadrant (smoothed over "
         "30 frames), plus as much zoom again to keep the edges covered.",
     ),
+    no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
 ) -> None:
     """Continue a clip past its last frame with a pix2pixHD next-frame
     generator fed its own output, frame by frame, and append the result.
@@ -549,34 +800,59 @@ def dream(
 
     from soto import pix2pixhd, video
 
-    weights = _resolve_checkpoint(checkpoint)
-    print(f"Probing {clip}...")
-    info = video.probe(clip)
-    conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
-    clip, info = _conform_clip(clip, info, conform_dir)
+    log = RunLog("dream", enabled=not no_metadata)
+    with log.guard(output):
+        weights = _resolve_checkpoint(checkpoint)
+        print(f"Probing {clip}...")
+        info = video.probe(clip)
+        conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
+        clip, info = _conform_clip(clip, info, conform_dir, log, "clip")
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    net, stride = pix2pixhd.load_generator(weights, device)
-    # The generator is fully convolutional, so it runs at the clip's own size
-    # (as it was trained on its video's), just rounded to its stride.
-    width, height = (max(stride, round(d / stride) * stride) for d in (info.width, info.height))
-    print(f"  working resolution {width}x{height}, {frames} frames ({frames / info.fps:.2f}s) on {device}")
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        net, stride, architecture = pix2pixhd.load_generator(weights, device)
+        # The generator is fully convolutional, so it runs at the clip's own size
+        # (as it was trained on its video's), just rounded to its stride.
+        width, height = (max(stride, round(d / stride) * stride) for d in (info.width, info.height))
+        if (width, height) != (info.width, info.height):
+            log.adjust("working_resolution", [info.width, info.height], [width, height],
+                       f"rounded to the generator's stride of {stride}")
+        log.settings.update({
+            "checkpoint": str(weights.resolve()),
+            "architecture": architecture,
+            "device": str(device),
+            "frames": frames,
+            "zoom": zoom,
+            "heat_seeking": heat_seeking,
+            "working_resolution": [width, height],
+            "seed": None,
+            "seed_note": "no randomness: the same clip, checkpoint and settings dream the same frames",
+        })
+        print(f"  working resolution {width}x{height}, {frames} frames ({frames / info.fps:.2f}s) on {device}")
 
-    start = video.extract_tail_context(clip, info, 1, width, height)[0]
-    print(f"Dreaming with {weights.name} and splicing...")
-    tmp_dir = Path(tempfile.mkdtemp(prefix="soto-dream-"))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    video.append_frames(
-        clip=clip,
-        info=info,
-        frames=_with_progress(pix2pixhd.dream(net, start, frames, zoom=zoom, heat_seeking=heat_seeking), frames),
-        lead_in=np.zeros((0, height, width, 3), dtype=np.float32),
-        output_path=output,
-        tmp_dir=tmp_dir,
-    )
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    shutil.rmtree(conform_dir, ignore_errors=True)
-    print(f"Done: {output}")
+        start = video.extract_tail_context(clip, info, 1, width, height)[0]
+        print(f"Dreaming with {weights.name} and splicing...")
+        tmp_dir = Path(tempfile.mkdtemp(prefix="soto-dream-"))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        # Frames are dreamed lazily as they're encoded, so this times both.
+        with log.run(frames=frames, context_frames=1,
+                     context_source={"clip": "clip", "frames": [info.n_frames - 1, info.n_frames]}):
+            video.extend_frames(
+                clip=clip,
+                info=info,
+                head=None,
+                head_fade=np.zeros((0, height, width, 3), dtype=np.float32),
+                tail=_with_progress(pix2pixhd.dream(net, start, frames, zoom=zoom, heat_seeking=heat_seeking), frames),
+                tail_fade=np.zeros((0, height, width, 3), dtype=np.float32),
+                output_path=output,
+                tmp_dir=tmp_dir,
+            )
+        log.segment("real", 0, info.n_frames, "clip", source="clip", source_frames=[0, info.n_frames])
+        log.segment("context", info.n_frames - 1, info.n_frames, "starting frame", run=1)
+        log.segment("generated", info.n_frames, info.n_frames + frames, f"dreamed ({weights.stem})", run=1)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(conform_dir, ignore_errors=True)
+        log.write(output, info.fps)
+        print(f"Done: {output}")
 
 
 if __name__ == "__main__":

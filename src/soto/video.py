@@ -192,6 +192,7 @@ def export_generated(
     info: ClipInfo,
     output_path: Path,
     audio_source: Path | None = None,
+    audio_offset_s: float = 0.0,
 ) -> None:
     """Writes `parts` in order as one clip at `info`'s native resolution and
     frame rate. Each part is either a (clip, start_frame, end_frame_exclusive)
@@ -220,7 +221,7 @@ def export_generated(
     else:
         video_only = tmp_dir / "video_only.mp4"
         _concat(files, video_only)
-        _mux_audio(video_only, audio_source, output_path)
+        _mux_audio(video_only, audio_source, output_path, offset_s=audio_offset_s)
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -406,46 +407,64 @@ def splice_fills(
     _mux_audio(video_only, clip, output_path)
 
 
-def append_frames(
+def extend_frames(
     *,
     clip: Path,
     info: ClipInfo,
-    frames: Iterable[np.ndarray],
-    lead_in: np.ndarray,
+    head: np.ndarray | None,
+    head_fade: np.ndarray,
+    tail: Iterable[np.ndarray] | None,
+    tail_fade: np.ndarray,
     output_path: Path,
     tmp_dir: Path,
 ) -> None:
-    """Writes `clip` followed by `frames` (at any resolution; scaled to the
-    clip's own; an array, or an iterable consumed lazily as the extension is
-    encoded). `lead_in` is VACE's decoded version of the clip's last
-    lead_in.shape[0] frames (may be empty), crossfaded over them to soften
-    the seam. The original audio track (if any) is carried over as-is, so it
-    ends where the original footage does."""
+    """Writes `head` + `clip` + `tail`, where `head` / `tail` (either may be
+    None) are new frames at any resolution, scaled to the clip's own. `tail`
+    can also be an iterable, consumed lazily as it's encoded. `head_fade` /
+    `tail_fade` are VACE's decoded versions of the clip's first / last few
+    frames (either may be empty), crossfaded over them to soften each seam.
+    The original audio track (if any) is carried over as-is, delayed by the
+    length of `head` so it stays in sync with the real footage."""
     tmp_dir.mkdir(parents=True, exist_ok=True)
     parts: list[Path] = []
-    real_end = info.n_frames - lead_in.shape[0]
-    if real_end > 0:
-        real = tmp_dir / "real.mp4"
-        _trim_frames(clip, 0, real_end, real)
-        parts.append(real)
-    if lead_in.shape[0]:
-        fade = tmp_dir / "fade.mp4"
-        blended = crossfade_frames(clip, info, real_end, lead_in, fade_in=True)
+    head_frames = 0
+    if head is not None:
+        head_video = tmp_dir / "head.mp4"
+        head_frames = head.shape[0]
+        _write_frames_to_video(head, info.fps, info.width, info.height, head_video)
+        parts.append(head_video)
+    real_start = head_fade.shape[0]
+    real_end = info.n_frames - tail_fade.shape[0]
+    if real_start:
+        fade = tmp_dir / "fade_head.mp4"
+        blended = crossfade_frames(clip, info, 0, head_fade, fade_in=False)
         _write_frames_to_video(blended, info.fps, info.width, info.height, fade)
         parts.append(fade)
-    extension = tmp_dir / "extension.mp4"
-    _write_frames_to_video(frames, info.fps, info.width, info.height, extension)
-    parts.append(extension)
+    if real_end > real_start:
+        real = tmp_dir / "real.mp4"
+        _trim_frames(clip, real_start, real_end, real)
+        parts.append(real)
+    if tail_fade.shape[0]:
+        fade = tmp_dir / "fade_tail.mp4"
+        blended = crossfade_frames(clip, info, real_end, tail_fade, fade_in=True)
+        _write_frames_to_video(blended, info.fps, info.width, info.height, fade)
+        parts.append(fade)
+    if tail is not None:
+        tail_video = tmp_dir / "tail.mp4"
+        _write_frames_to_video(tail, info.fps, info.width, info.height, tail_video)
+        parts.append(tail_video)
 
     video_only = tmp_dir / "video_only.mp4"
     _concat(parts, video_only)
-    _mux_audio(video_only, clip, output_path)
+    _mux_audio(video_only, clip, output_path, offset_s=head_frames / info.fps)
 
 
-def _mux_audio(video_only: Path, audio_source: Path, output_path: Path) -> None:
-    """Copies `video_only`'s video and `audio_source`'s audio (if it has any) into `output_path`."""
+def _mux_audio(video_only: Path, audio_source: Path, output_path: Path, offset_s: float = 0.0) -> None:
+    """Copies `video_only`'s video and `audio_source`'s audio (if it has any)
+    into `output_path`, the audio starting `offset_s` seconds in."""
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error", "-i", str(video_only), "-i", str(audio_source),
+        "ffmpeg", "-y", "-loglevel", "error", "-i", str(video_only),
+        *(["-itsoffset", f"{offset_s:.6f}"] if offset_s else []), "-i", str(audio_source),
         "-map", "0:v", "-map", "1:a?", "-c:v", "copy", "-c:a", "copy", str(output_path),
     ]
     subprocess.run(cmd, check=True)

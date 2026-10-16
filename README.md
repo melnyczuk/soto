@@ -49,6 +49,85 @@ one's output, so the clip grows by `frames * iterations` in total. Each pass
 uses `--seed + i`. `--context`, `--model`, `--prompt` and `--steps` behave as
 above.
 
+`--side` picks which end of the clip grows. `end` is the default. `start`
+generates frames leading *into* the first frame, conditioned on the clip's
+head, and `bookend` does both:
+
+```bash
+uv run soto extend clip.mp4 -o output.mp4 --frames 32 --side bookend
+```
+
+`--frames` and `--iterations` apply per side, so `bookend` adds twice as many
+frames. Both sides use the same per-pass seeds, so `--side start --seed S`
+reproduces the start of a `--side bookend --seed S` run. When frames are
+added at the start, the original audio is delayed to stay in sync with the
+real footage, and the new frames are silent.
+
+## Previews
+
+`transition`, `bridge` and `extend` take `--preview fast` or `--preview
+draft` for a quick, rough look before committing to a full run:
+
+- `fast` runs at about 480x272 instead of 832x480 and takes 2 steps instead
+  of 20. That's ~3x fewer tokens, and attention cost grows roughly with the
+  square of that, plus 10x fewer steps. It's fine for judging the prompt,
+  the motion and the seams. But the initial noise depends on the resolution,
+  so the same seed won't give the same picture at full size.
+- `draft` keeps the working resolution and takes 3 steps, about 7x faster.
+  Frames come out soft and smeared, but the noise is the same as a full run's,
+  so the same seed gives the same layout and motion.
+
+Every run ends by printing its seed. To render a draft properly, re-run it
+without `--preview` and with that seed:
+
+```bash
+uv run soto transition a.mp4 b.mp4 -o draft.mp4 --duration 1.5 --preview draft
+uv run soto transition a.mp4 b.mp4 -o final.mp4 --duration 1.5 --seed 123456
+```
+
+Passing `--steps` explicitly overrides the preview's step count. The tiers
+live in `config.PREVIEW_TIERS`. Output is still scaled back to the clip's
+native size, so you can lay a preview over the footage in an editor.
+
+## Run metadata
+
+Every command writes a sidecar next to its output (`out.mp4` gets
+`out.json`). The sidecar records:
+
+- `settings`: what was actually used. That's the model and checkpoint,
+  prompt and negative prompt, steps, seed (and whether it was given or
+  random), working resolution, CFG, sampler, scheduler, shift, and context
+  and crossfade. For `dream`, it's the checkpoint, its architecture, the
+  device, zoom and heat-seeking.
+- `adjustments`: every value soto changed from what you asked for, and why.
+  For example: a gap rounded up to VACE's length stride, context nudged or
+  cut short by the footage available, crossfades shared between neighbouring
+  bridges, or steps lowered by `--preview`.
+- `inputs`: each clip's probe info and any conforming (frame rate, size).
+- `runs`: one entry per model call, with its seed, steps, frame counts,
+  where its context came from, and how long it took.
+- `segments`: the output timeline in frames, seconds and `HH:MM:SS:FF`
+  timecode. It shows where real footage, crossfades and generated frames
+  sit, and where each run's context starts and ends.
+- `blank_intervals` (`bridge` only): each detected blank and whether it was
+  bridged or skipped.
+- The git commit (and whether the tree was dirty), the command line, and
+  start and finish times.
+
+The real, crossfade and generated segments are also embedded in the output
+as chapter markers, without re-encoding. They show up in QuickTime, VLC
+and mpv. Most NLEs (Resolve, Premiere) don't import mp4 chapters, so use the
+timecodes in the JSON there. Pass `--no-metadata` to skip both.
+
+If a run crashes or is interrupted, everything logged up to that point goes
+to `out.failed.json` instead. That includes the settings, the seed, the
+adjustments, and every model call so far, with the one that failed marked
+`"failed": true`. It also gets a `status` (`failed` or `interrupted`) and
+the error with its traceback. The record is kept separate so a crash never
+overwrites `out.json` from an earlier successful run. The next successful
+run to that output deletes it. Bad options (e.g. a `--crossfade` that's too
+long) are rejected before anything runs, so they don't leave a record.
+
 ## Dreaming with pix2pixHD
 
 `dream` also continues a clip past its last frame, but with a pix2pixHD

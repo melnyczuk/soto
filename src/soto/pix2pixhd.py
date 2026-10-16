@@ -62,9 +62,10 @@ def _global_generator(ngf: int, n_downsampling: int, n_blocks: int) -> nn.Sequen
     return nn.Sequential(*layers)
 
 
-def load_generator(path: Path, device: torch.device) -> tuple[nn.Sequential, int]:
-    """Loads a pix2pixHD GlobalGenerator checkpoint. Returns (net, stride):
-    frames fed to `net` need both dimensions to be a multiple of `stride`.
+def load_generator(path: Path, device: torch.device) -> tuple[nn.Sequential, int, dict[str, int]]:
+    """Loads a pix2pixHD GlobalGenerator checkpoint. Returns (net, stride,
+    architecture): frames fed to `net` need both dimensions to be a multiple
+    of `stride`, and `architecture` is what was read off the weights.
 
     The architecture is read off the weights rather than hard-coded: instance
     norm has no parameters, so the only top-level weights are the convs -- one
@@ -79,7 +80,8 @@ def load_generator(path: Path, device: torch.device) -> tuple[nn.Sequential, int
 
     net = _global_generator(ngf, n_downsampling, n_blocks)
     net.load_state_dict(state)
-    return net.to(device).eval(), 2**n_downsampling
+    architecture = {"ngf": ngf, "n_downsampling": n_downsampling, "n_blocks": n_blocks}
+    return net.to(device).eval(), 2**n_downsampling, architecture
 
 
 def _move_camera(x: torch.Tensor, zoom: float, heat_seeking: float, pans: deque) -> torch.Tensor:

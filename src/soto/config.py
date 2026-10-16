@@ -114,6 +114,15 @@ DEFAULT_CONTEXT_S = 1.0
 DEFAULT_WIDTH = 832
 DEFAULT_HEIGHT = 480
 
+# --preview tiers: (working-area override or None to keep the default, steps).
+# "draft" keeps the working resolution, so the same seed reproduces its
+# layout in a full run (the initial noise depends on the latent shape, not on
+# the step count); "fast" drops to the old 480x272 area, so it doesn't.
+PREVIEW_TIERS: dict[str, tuple[int | None, int]] = {
+    "fast": (480 * 272, 2),
+    "draft": (None, 3),
+}
+
 # Wan's causal VAE has temporal stride 4 (+1 leading frame); WanVaceToVideo's
 # `length` should satisfy (length - 1) % 4 == 0 for a clean latent frame count.
 VACE_LENGTH_STRIDE = 4
