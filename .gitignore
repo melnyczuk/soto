@@ -19,6 +19,7 @@ vendor/ComfyUI/input/
 vendor/ComfyUI/temp/
 vendor/ComfyUI/user/
 
+outputs/
 *.mp4
 *.log
 *.gguf
