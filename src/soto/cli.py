@@ -747,7 +747,8 @@ def dream(
     """Continue a clip past its last frame with a pix2pixHD next-frame
     generator fed its own output, frame by frame, to add with `soto
     crossfade`. Seconds per second of footage rather than `extend`'s hours,
-    but it only knows the one video its checkpoint was trained on."""
+    but it only knows the footage its checkpoint was trained on (train
+    your own with `soto train`)."""
     import torch
 
     from soto import pix2pixhd, video
@@ -809,6 +810,227 @@ def dream(
         log.data["audio"] = {"source": "clip", "offset_frames": 0}
         shutil.rmtree(conform_dir, ignore_errors=True)
         _print_done(output, None, None, log, info.fps)
+
+
+@app.command()
+def train(
+    clips: list[Path] = typer.Argument(
+        ..., exists=True, dir_okay=False,
+        help="Footage to learn from. Several clips train one generator on all of them, never across their joins.",
+    ),
+    name: str = typer.Option(
+        ..., "--name",
+        help="The generator's name: it's written to models/pix2pixhd/<name>.pth, for `soto dream --checkpoint <name>`.",
+    ),
+    epochs: float = typer.Option(
+        config.TRAIN_DEFAULT_EPOCHS, "--epochs", min=0.0,
+        help="Training length, in passes over every frame of the clips. Ignored if --steps is given.",
+    ),
+    steps: int | None = typer.Option(None, "--steps", min=1, help="Training length in optimizer steps."),
+    crop: int = typer.Option(
+        config.TRAIN_DEFAULT_CROP, "--crop", min=16,
+        help="Side of the square trained on, cropped at random from full-size frames. Bigger sees more "
+        "context per step but is slower.",
+    ),
+    scale: float = typer.Option(
+        1.0, "--scale", min=0.05, max=1.0,
+        help="Scale the frames by this before training (e.g. 0.5 for 4x fewer pixels). The generator then "
+        "dreams best at that scale too.",
+    ),
+    unroll: int = typer.Option(
+        config.TRAIN_DEFAULT_UNROLL, "--unroll", min=1,
+        help="Most frames the generator runs on its own output before the one it's trained to predict, "
+        "reached halfway through training. Higher teaches it to hold long dreams together; each of those "
+        "frames costs a quick extra pass.",
+    ),
+    noise: float = typer.Option(
+        config.TRAIN_DEFAULT_NOISE, "--noise", min=0.0,
+        help="Std of the Gaussian noise added to every input frame (in [-1, 1] units), for robustness.",
+    ),
+    flip: bool = typer.Option(False, "--flip", help="Randomly mirror windows left-right (mirrors motion too)."),
+    ngf: int = typer.Option(
+        64, "--ngf", min=8,
+        help="Generator width (base filter count) when training from scratch. 64 is pix2pixHD's default; 32, "
+        "the size of the old nasa and balloon generators, trains about twice as fast but holds less detail.",
+    ),
+    init: str | None = typer.Option(
+        None, "--init",
+        help="Start from an existing generator (a name in models/pix2pixhd/ or a .pth path) instead of from scratch.",
+    ),
+    resume: bool = typer.Option(
+        False, "--resume", help="Continue an interrupted run of the same --name from its saved state.",
+    ),
+    save_every: int = typer.Option(500, "--save-every", min=1, help="Steps between checkpoint saves."),
+    preview_every: int = typer.Option(
+        2000, "--preview-every", min=0,
+        help="Steps between preview dreams (0 for none), written to models/pix2pixhd/<name>.train/.",
+    ),
+    preview_seconds: float = typer.Option(5.0, "--preview-seconds", min=0.1, help="Length of each preview."),
+    no_metadata: bool = typer.Option(
+        False, "--no-metadata", help="Don't write models/pix2pixhd/<name>.json (settings, inputs and timings).",
+    ),
+) -> None:
+    """Train a pix2pixHD next-frame generator for `soto dream` on your own
+    footage. It's trained on predicting real frames from its own output as
+    well as from real ones, so its dreams hold together longer than a
+    generator only ever shown real frames. Ctrl-C saves and stops; --resume
+    carries on."""
+    import signal
+    import time
+
+    import numpy as np
+    import torch
+
+    from soto import pix2pixhd, pix2pixhd_train as pt, video
+
+    if resume and init:
+        raise typer.BadParameter("--resume continues from its own saved state, so it can't take --init too",
+                                 param_hint="--init")
+    out = config.PIX2PIXHD_DIR / f"{name}.pth"
+    train_dir = config.PIX2PIXHD_DIR / f"{name}.train"
+    state_path = train_dir / "state.pt"
+    if resume and not state_path.is_file():
+        raise typer.BadParameter(f"no saved state at {state_path} to resume from", param_hint="--resume")
+    if not resume and (out.exists() or state_path.exists()):
+        raise typer.BadParameter(
+            f"{out} already exists: pass --resume to continue training it, or pick another name",
+            param_hint="--name",
+        )
+
+    log = RunLog("train", enabled=not no_metadata)
+    with log.guard(out):
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        if init or resume:
+            # Resuming rebuilds the generator from its own last checkpoint, so
+            # it's the architecture it was started with, whatever --ngf says.
+            weights = _resolve_checkpoint(init) if init else out
+            net_g, stride, architecture = pix2pixhd.load_generator(weights, torch.device("cpu"))
+        else:
+            architecture = {"ngf": ngf, "n_downsampling": 4, "n_blocks": 9}
+            net_g = pix2pixhd.global_generator(**architecture)
+            stride = 16
+
+        # Frames and crops are kept to multiples of the generator's stride,
+        # as `soto dream` rounds clips to it.
+        def to_stride(d: float) -> int:
+            return max(stride, round(d / stride) * stride)
+
+        want_crop, crop = crop, to_stride(crop)
+        if crop != want_crop:
+            log.adjust("crop", want_crop, crop, f"rounded to the generator's stride of {stride}")
+
+        clip_frames = []
+        for i, clip in enumerate(clips):
+            print(f"Probing {clip}...")
+            info = video.probe(clip)
+            width, height = to_stride(info.width * scale), to_stride(info.height * scale)
+            changes = [f"size {info.width}x{info.height} -> {width}x{height}"] if (width, height) != (
+                info.width, info.height) else []
+            log.input(f"clip{i + 1}" if len(clips) > 1 else "clip", clip, info, changes)
+            frames = pt.cache_frames(clip, info, width, height, train_dir)
+            if len(frames.frames) < unroll + 2:
+                raise typer.BadParameter(
+                    f"{clip} has {len(frames.frames)} frames, but --unroll {unroll} needs at least {unroll + 2}",
+                    param_hint="--unroll",
+                )
+            clip_frames.append(frames)
+
+        pairs = sum(len(c.frames) - 1 for c in clip_frames)
+        total = steps if steps is not None else max(1, round(epochs * pairs))
+        sampler = pt.WindowSampler(clip_frames, crop, flip)
+        trainer = pt.Trainer(net_g, device, noise=noise)
+        start = 0
+        if resume:
+            start = trainer.load_state(torch.load(state_path, map_location=device, weights_only=True))
+            print(f"Resuming {name} from step {start}")
+
+        # Previews all dream from the same real frame, the middle of the first
+        # clip, at full size, so they show the dreams improving step by step.
+        preview_clip = clip_frames[0]
+        preview_index = len(preview_clip.frames) // 2
+        preview_frames = round(preview_seconds * preview_clip.fps)
+        fps = preview_clip.fps
+
+        log.settings.update({
+            "name": name,
+            "output": str(out.resolve()),
+            "init": str(_resolve_checkpoint(init).resolve()) if init else None,
+            "architecture": architecture,
+            "device": str(device),
+            "steps": total,
+            "epochs": total / pairs,
+            "frame_pairs": pairs,
+            "crop": crop,
+            "scale": scale,
+            "frame_sizes": [list(c.frames.shape[2:0:-1]) for c in clip_frames],
+            "unroll": unroll,
+            "noise": noise,
+            "flip": flip,
+            "lr": config.TRAIN_LR,
+            "betas": list(config.TRAIN_BETAS),
+            "lambda_feat": config.TRAIN_LAMBDA_FEAT,
+            "lambda_vgg": config.TRAIN_LAMBDA_VGG,
+            "resumed_from_step": start if resume else None,
+        })
+
+        def save(step: int) -> None:
+            pt.save_atomic(pt.generator_state(trainer.net_g), out)
+            pt.save_atomic(trainer.state(step), state_path)
+
+        def preview(step: int) -> None:
+            real = preview_clip.frames[preview_index][None].astype(np.float32) / 255
+            path = train_dir / f"preview-{step:07d}.mp4"
+            video.write_preview(pix2pixhd.dream(trainer.net_g, real, preview_frames), fps, path)
+            trainer.net_g.train()
+            print(f"\n  preview: {path}")
+
+        print(f"Training {name} on {device}: {total} steps ({total / pairs:.2f} epochs of {pairs} frame pairs), "
+              f"{crop}px crops, rolling out up to {unroll} frames")
+        step = start
+        interrupted = False
+        train_s = 0.0  # time spent in training steps, not saves or previews
+
+        # Ctrl-C or a plain `kill` saves and stops. SIGINT's handler is set
+        # explicitly because a shell starting this in the background leaves
+        # SIGINT ignored, and Python then never raises KeyboardInterrupt.
+        def stop(signum, frame):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, stop)
+        with log.run(start_step=start, total_steps=total) as run:
+            try:
+                while step < total:
+                    rollout = sampler.rollout(pt.max_rollout_at(step, total, unroll))
+                    trainer.set_lr(pt.lr_at(step, total))
+                    t_step = time.perf_counter()
+                    losses = trainer.step(sampler.sample(rollout + 2, device))
+                    train_s += time.perf_counter() - t_step
+                    step += 1
+                    rate = train_s / (step - start)
+                    eta = rate * (total - step)
+                    print(
+                        f"\r  step {step}/{total}  rollout {rollout}  D {losses['d']:.3f}  G {losses['gan']:.3f}  "
+                        f"feat {losses['feat']:.3f}  vgg {losses['vgg']:.3f}  "
+                        f"{rate:.2f}s/step  eta {eta / 3600:.1f}h ",
+                        end="", flush=True,
+                    )
+                    if step % save_every == 0:
+                        save(step)
+                    if preview_every and step % preview_every == 0:
+                        preview(step)
+            except KeyboardInterrupt:
+                interrupted = True
+                print("\n  interrupted: saving...")
+            run["end_step"] = step
+        print()
+        save(step)
+        if preview_every and step % preview_every:
+            preview(step)
+        log.settings["stopped_at_step"] = step
+        log.write(out, fps)
+        print(f"Done: {out}" + (f" (stopped at step {step}; --resume to carry on)" if interrupted else ""))
+        print(f"Dream with it: soto dream CLIP -o gen.mkv --checkpoint {name} --frames 250")
 
 
 def _parse_size(value: str) -> tuple[int, int]:

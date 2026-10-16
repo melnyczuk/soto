@@ -153,14 +153,15 @@ generation command means its output can't be spliced.
 ## Dreaming with pix2pixHD
 
 `dream` also continues a clip past its last frame, but with a pix2pixHD
-generator from the older soto-pix2pixHD project instead of VACE: a GAN
-trained on one video to predict each frame from the one before, fed its own
-output frame after frame, ported here for inference only
+generator instead of VACE: a GAN trained on one video to predict each frame
+from the one before, fed its own output frame after frame
 ([`pix2pixhd.py`](src/soto/pix2pixhd.py)). It takes seconds per second of
 footage rather than VACE's hours (~0.3s/frame at 1920x1088 on MPS), but it
-only knows the video its checkpoint was trained on. On that video it carries
-on from the last real frame and then drifts off into its own GAN-flavoured
-version of it. On anything else it jumps straight there.
+only knows the footage its checkpoint was trained on. On that footage it
+carries on from the last real frame and then drifts off into its own
+GAN-flavoured version of it. On anything else it jumps straight there. Train
+one on your own footage with `soto train`
+([below](#training-your-own-dream-model)).
 
 ```bash
 uv run soto dream clip.mp4 -o gen.mkv --checkpoint nasa --frames 250
@@ -176,8 +177,9 @@ The `.mkv` is the clip's resolution rounded to multiples of 16, and lossless,
 so it's big (about 3MB per frame at 1920x1088).
 
 `--checkpoint` is the name of a generator in `models/pix2pixhd/` or a path to
-one. These aren't downloaded by `soto setup`; copy them in from the old
-project's `checkpoints/<name>/latest_net_G.pth` (only the generator is needed,
+one. These aren't downloaded by `soto setup`. Train them with `soto train`, or
+copy them in from the older soto-pix2pixHD project's
+`checkpoints/<name>/latest_net_G.pth` (only the generator is needed,
 not the discriminators or the per-epoch snapshots):
 
 ```bash
@@ -197,6 +199,66 @@ smoothed over 30 frames, plus N pixels of zoom so the pan never exposes the
 edges. They now run as a single resample on the GPU. The original went through
 uint8 and PIL for each move, and its truncation darkened every frame by about
 half a level per move.
+
+## Training your own dream model
+
+`train` trains a generator for `dream` on your own footage
+([`pix2pixhd_train.py`](src/soto/pix2pixhd_train.py)):
+
+```bash
+uv run soto train clip.mp4 --name mine
+uv run soto dream clip.mp4 -o gen.mkv --checkpoint mine --frames 250
+```
+
+The networks and losses are pix2pixHD's: the same generator, a two-scale
+PatchGAN discriminator, LSGAN, discriminator feature matching and VGG19
+perceptual loss. Two things differ from how the old generators were trained:
+
+- **It trains on its own output.** The old generators only ever saw real
+  frames, so in a dream, fed their own output, small errors compounded until
+  the picture melted. Here the generator first runs on its own for up to
+  `--unroll` frames (4 by default) from a real frame, without gradients, then
+  is trained to predict the next real frame from where it got to. The depth
+  is random per step and its ceiling grows over the first half of training,
+  so it learns both to follow the footage and to pull its own drift back
+  toward it.
+- **It trains at full resolution.** Frames stay at the clip's own size
+  (rounded to 16) and are trained on in random `--crop`-pixel squares (512 by
+  default) instead of being downscaled. The generator is fully convolutional,
+  so it dreams whole frames at the scale it learned detail at. `--scale 0.5`
+  trains on half-size frames instead, for footage you'll dream at that size.
+
+New generators are pix2pixHD's default width, `--ngf 64`, four times the
+parameters of the old `nasa` and `balloon` (`--ngf 32`). `--init balloon`
+fine-tunes an existing generator instead of starting from scratch.
+
+Several clips train one generator on all of them (`soto train a.mp4 b.mp4
+--name mixed`), never across the join between two. That gives a generator
+that has seen more kinds of picture, but it's still a next-frame GAN: on
+footage unlike anything it was trained on, it jumps straight into its own
+version of what it knows.
+
+Training length is `--epochs` (10 by default) passes over every frame, or
+`--steps`. On an M2 Pro, a step takes about 3s at `--ngf 64` and 1.6s at
+`--ngf 32` with 512px crops, so 10 epochs of a one-minute 25fps clip (15,000
+steps) is about 12 hours, or 7 at `--ngf 32`. Crop size matters less than
+you'd expect, because most of each step is a fixed cost: 256px crops are only
+about twice as fast as 512px.
+
+Everything is saved under `models/pix2pixhd/`:
+
+- `<name>.pth`: the generator, every `--save-every` steps (500), so `dream`
+  can use it while training carries on.
+- `<name>.train/`: the decoded frames (cached as raw RGB, about 6MB per 1080p
+  frame, and reused by later runs on the same clip), the full training state,
+  and a preview dream every `--preview-every` steps (2000). Each preview runs
+  `--preview-seconds` (5) from the middle frame of the first clip, so
+  successive previews show the dreams holding together for longer.
+- `<name>.json`: the settings, inputs and timings.
+
+Ctrl-C (or `kill`) saves and stops. Re-run the same command with `--resume`
+to carry on from where it stopped. Delete `<name>.train/` once you're done to
+reclaim the frame cache.
 
 ## Expanding the frame
 

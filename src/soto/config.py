@@ -84,10 +84,23 @@ VAE_DEVICES = ("gpu", "cpu")
 VAE_DTYPES = ("bf16", "fp16", "fp32")
 
 # pix2pixHD next-frame generators for `soto dream`, as `<name>.pth`. Not
-# downloaded by `soto setup`: they're the generators trained per video in
-# the older soto-pix2pixHD project (its checkpoints/<name>/latest_net_G.pth),
-# copied in by hand.
+# downloaded by `soto setup`: they're trained with `soto train` (which also
+# keeps its frame cache, resumable state and previews in `<name>.train/`),
+# or copied in by hand from the older soto-pix2pixHD project (its
+# checkpoints/<name>/latest_net_G.pth).
 PIX2PIXHD_DIR = MODELS_DIR / "pix2pixhd"
+
+# `soto train` defaults. pix2pixHD's own: Adam at 2e-4 with beta1 0.5, held
+# for the first half of training and decayed linearly to 0 over the second,
+# and feature-matching and VGG losses weighted 10 each against the GAN loss.
+TRAIN_LR = 2e-4
+TRAIN_BETAS = (0.5, 0.999)
+TRAIN_LAMBDA_FEAT = 10.0
+TRAIN_LAMBDA_VGG = 10.0
+TRAIN_DEFAULT_EPOCHS = 10
+TRAIN_DEFAULT_CROP = 512
+TRAIN_DEFAULT_UNROLL = 4
+TRAIN_DEFAULT_NOISE = 0.02
 # UNET goes directly in MODELS_DIR (flat), matching where the unused legacy
 # GGUF checkpoints already sit -- both map to extra_model_paths.yaml's
 # `diffusion_models: models/` entry, no separate subfolder needed.

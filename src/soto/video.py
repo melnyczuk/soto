@@ -72,6 +72,32 @@ def _read_frames(path: Path, start_frame: int, n_frames: int, width: int, height
     return arr.reshape(n_frames, height, width, 3).astype(np.float32) / 255.0
 
 
+def iter_frames(path: Path, width: int, height: int, flags: str = "area") -> Iterable[np.ndarray]:
+    """Yields every frame of `path`, scaled to width x height, as (H, W, 3)
+    uint8, decoding the whole clip in one pass (read_frames re-decodes from
+    the start on every call, which is quadratic over a long clip)."""
+    cmd = [
+        "ffmpeg", "-loglevel", "error", "-i", str(path),
+        "-vf", f"scale={width}:{height}:flags={flags}",
+        "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    assert proc.stdout is not None
+    frame_size = width * height * 3
+    try:
+        while len(raw := proc.stdout.read(frame_size)) == frame_size:
+            yield np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+    finally:
+        proc.stdout.close()
+        proc.kill()
+        proc.wait()
+
+
+def write_preview(frames: Iterable[np.ndarray], fps: float, output_path: Path) -> int:
+    """Writes (H, W, 3) float32 frames in [0, 1] as a small H.264 mp4, unscaled."""
+    return _pipe_frames(frames, fps, output_path, ["-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p"])
+
+
 def extract_tail_context(path: Path, info: ClipInfo, context_frames: int, width: int, height: int) -> np.ndarray:
     context_frames = min(context_frames, info.n_frames)
     start = info.n_frames - context_frames

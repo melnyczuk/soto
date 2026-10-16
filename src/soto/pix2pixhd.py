@@ -1,9 +1,9 @@
 """pix2pixHD next-frame "dreaming", ported from the older soto-pix2pixHD
 project: a GlobalGenerator trained on a single video to predict frame t+1
 from frame t, fed its own output in a loop to continue a clip for as long as
-you like. Inference only -- training stayed behind in that project, and its
-generator checkpoints (`checkpoints/<name>/latest_net_G.pth`) load here
-as-is.
+you like. That project's generator checkpoints
+(`checkpoints/<name>/latest_net_G.pth`) load here as-is, as do the ones
+`soto train` writes (see pix2pixhd_train.py).
 
 The camera moves (zoom, heat-seeking) are reimplemented as one on-device
 affine resample per frame. The original round-tripped every frame through
@@ -41,7 +41,7 @@ class _ResnetBlock(nn.Module):
         return x + self.conv_block(x)
 
 
-def _global_generator(ngf: int, n_downsampling: int, n_blocks: int) -> nn.Sequential:
+def global_generator(ngf: int, n_downsampling: int, n_blocks: int) -> nn.Sequential:
     """pix2pixHD's GlobalGenerator (RGB in, RGB out, instance norm), as the
     bare Sequential it wraps -- checkpoint keys are this with a "model." prefix."""
     layers: list[nn.Module] = [
@@ -78,7 +78,7 @@ def load_generator(path: Path, device: torch.device) -> tuple[nn.Sequential, int
     n_downsampling = (len(convs) - 2) // 2
     ngf = state[f"{convs[0]}.weight"].shape[0]
 
-    net = _global_generator(ngf, n_downsampling, n_blocks)
+    net = global_generator(ngf, n_downsampling, n_blocks)
     net.load_state_dict(state)
     architecture = {"ngf": ngf, "n_downsampling": n_downsampling, "n_blocks": n_blocks}
     return net.to(device).eval(), 2**n_downsampling, architecture
