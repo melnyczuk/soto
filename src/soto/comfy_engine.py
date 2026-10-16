@@ -11,10 +11,15 @@ PromptServer (without binding a port -- some node code reports progress via
 from __future__ import annotations
 
 import asyncio
+import functools
 import sys
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
+import typer
+from tqdm import tqdm
 
 from soto import config
 
@@ -101,6 +106,12 @@ def _bootstrap() -> None:
             )
         _node_classes[name] = nodes.NODE_CLASS_MAPPINGS[name]
 
+    # ComfyUI draws the sampler's progress bar itself; colour it to match the
+    # VAE bars in run_vace_transition(). Only uni_pc's (config.SAMPLER_NAME).
+    import comfy.extra_samplers.uni_pc as uni_pc
+
+    uni_pc.trange = functools.partial(uni_pc.trange, colour="magenta")
+
 
 def _call(node_cls, **kwargs):
     """Calls a node regardless of whether it's a classic (INPUT_TYPES/FUNCTION)
@@ -110,6 +121,33 @@ def _call(node_cls, **kwargs):
         instance = node_cls()
         return getattr(instance, node_cls.FUNCTION)(**kwargs)
     return node_cls.execute(**kwargs).args
+
+
+@contextmanager
+def _vae_progress(module: torch.nn.Module, total: int, colour: str, frames_per_call):
+    """Shows a progress bar over `total` frames while the Wan VAE's encoder or
+    decoder (`module`) runs. Neither reports progress itself, but WanVAE calls
+    them once per temporal chunk, so a forward hook can count the chunks off;
+    `frames_per_call(t, done)` says how many frames a chunk of t input frames
+    is worth, given how many the bar has already counted."""
+    bar = tqdm(total=total, unit="frame", colour=colour)
+
+    # Must return None: anything else replaces the module's output.
+    def count(_module, args, _output) -> None:
+        # MPS runs asynchronously: the call returns as soon as the chunk's work
+        # is queued, so without waiting for it a whole pass gets counted off
+        # in an instant and the bar then sits at the end. Each chunk depends
+        # on the last one's cache anyway, so this costs next to nothing.
+        if args[0].device.type == "mps":
+            torch.mps.synchronize()
+        bar.update(frames_per_call(args[0].shape[2], bar.n))
+
+    handle = module.register_forward_hook(count)
+    try:
+        yield
+    finally:
+        handle.remove()
+        bar.close()
 
 
 @dataclass
@@ -130,9 +168,22 @@ def run_vace_transition(
     steps: int,
     seed: int,
 ) -> TransitionResult:
+    # Stage lines are stamped with the time since the start, in front rather
+    # than after, so ComfyUI's own warnings landing mid-stage can't split them.
+    start = time.monotonic()
+
+    def stage(label: str, colour: str | None = None) -> None:
+        clock = typer.style(tqdm.format_interval(time.monotonic() - start), dim=True)
+        typer.echo(f"  {clock} {typer.style(label, fg=colour, bold=True)}")
+
+    if not _node_classes:
+        stage("starting ComfyUI")
     _bootstrap()
 
     spec = config.MODELS[model]
+    # What the VAE actually covers: it drops frames past the last whole stride.
+    stride = config.VACE_LENGTH_STRIDE
+    vae_frames = 1 + (length - 1) // stride * stride
 
     # ComfyUI's own graph executor (execution.py) always runs node execution
     # under torch.inference_mode(); calling node classes directly bypasses
@@ -144,6 +195,7 @@ def run_vace_transition(
     # worth of what looked like MPS-specific OOMs at any model size/attention
     # backend -- not an MPS bug, a missing no-grad context in this file.
     with torch.inference_mode():
+        stage(f"loading UNet ({model})")
         if spec.loader == "UNETLoader":
             (loaded_model,) = _call(
                 _node_classes["UNETLoader"], unet_name=spec.filename, weight_dtype="default"
@@ -154,13 +206,16 @@ def run_vace_transition(
             _node_classes["ModelSamplingSD3"], model=loaded_model, shift=config.MODEL_SHIFT
         )
 
+        stage("loading text encoder")
         (clip,) = _call(
             _node_classes["CLIPLoaderGGUF"],
             clip_name=config.TEXT_ENCODER_FILENAME,
             type=config.CLIP_TYPE,
         )
+        stage("loading VAE")
         (vae,) = _call(_node_classes["VAELoader"], vae_name=config.VAE_FILENAME)
 
+        stage("encoding prompt")
         (positive,) = _call(_node_classes["CLIPTextEncode"], clip=clip, text=prompt)
         (negative,) = _call(_node_classes["CLIPTextEncode"], clip=clip, text=negative_prompt)
 
@@ -173,20 +228,25 @@ def run_vace_transition(
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache(force=True)
 
-        positive, negative, latent, _trim_latent = _call(
-            _node_classes["WanVaceToVideo"],
-            positive=positive,
-            negative=negative,
-            vae=vae,
-            width=width,
-            height=height,
-            length=length,
-            batch_size=1,
-            strength=1.0,
-            control_video=control_video,
-            control_masks=control_mask,
-        )
+        # WanVaceToVideo encodes the control video twice: once with the masked
+        # (to-generate) frames blanked, once with only those frames.
+        stage(f"encoding {length} control frames", "cyan")
+        with _vae_progress(vae.first_stage_model.encoder, 2 * vae_frames, "cyan", lambda t, _done: t):
+            positive, negative, latent, _trim_latent = _call(
+                _node_classes["WanVaceToVideo"],
+                positive=positive,
+                negative=negative,
+                vae=vae,
+                width=width,
+                height=height,
+                length=length,
+                batch_size=1,
+                strength=1.0,
+                control_video=control_video,
+                control_masks=control_mask,
+            )
 
+        stage(f"sampling ({steps} steps)", "magenta")
         (samples,) = _call(
             _node_classes["KSampler"],
             model=loaded_model,
@@ -207,6 +267,12 @@ def run_vace_transition(
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache(force=True)
 
-        (images,) = _call(_node_classes["VAEDecode"], vae=vae, samples=samples)
+        # The decoder's input is latent frames: the first becomes 1 frame,
+        # every later one `stride` frames.
+        stage(f"decoding {vae_frames} frames", "green")
+        with _vae_progress(vae.first_stage_model.decoder, vae_frames, "green",
+                           lambda t, done: stride * t - (stride - 1 if done == 0 else 0)):
+            (images,) = _call(_node_classes["VAEDecode"], vae=vae, samples=samples)
 
+    stage("done", "green")
     return TransitionResult(frames=images)
