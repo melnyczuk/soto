@@ -110,7 +110,7 @@ def _bootstrap() -> None:
     # VAE bars in run_vace_transition(). Only uni_pc's (config.SAMPLER_NAME).
     import comfy.extra_samplers.uni_pc as uni_pc
 
-    uni_pc.trange = functools.partial(uni_pc.trange, colour="magenta")
+    uni_pc.trange = functools.partial(uni_pc.trange, colour="magenta", dynamic_ncols=True)
 
 
 def _call(node_cls, **kwargs):
@@ -123,6 +123,16 @@ def _call(node_cls, **kwargs):
     return node_cls.execute(**kwargs).args
 
 
+def _wait_for(t: torch.Tensor) -> None:
+    """MPS runs asynchronously: a module call returns as soon as its work is
+    queued, so a progress hook that doesn't wait counts it done right away
+    and the bar then sits at the end. The work waited on is sequential anyway
+    (each VAE chunk needs the last one's cache, each block the last one's
+    output), so this costs next to nothing."""
+    if t.device.type == "mps":
+        torch.mps.synchronize()
+
+
 @contextmanager
 def _vae_progress(module: torch.nn.Module, total: int, colour: str, frames_per_call):
     """Shows a progress bar over `total` frames while the Wan VAE's encoder or
@@ -130,16 +140,11 @@ def _vae_progress(module: torch.nn.Module, total: int, colour: str, frames_per_c
     them once per temporal chunk, so a forward hook can count the chunks off;
     `frames_per_call(t, done)` says how many frames a chunk of t input frames
     is worth, given how many the bar has already counted."""
-    bar = tqdm(total=total, unit="frame", colour=colour)
+    bar = tqdm(total=total, unit="frame", colour=colour, dynamic_ncols=True)
 
     # Must return None: anything else replaces the module's output.
     def count(_module, args, _output) -> None:
-        # MPS runs asynchronously: the call returns as soon as the chunk's work
-        # is queued, so without waiting for it a whole pass gets counted off
-        # in an instant and the bar then sits at the end. Each chunk depends
-        # on the last one's cache anyway, so this costs next to nothing.
-        if args[0].device.type == "mps":
-            torch.mps.synchronize()
+        _wait_for(args[0])
         bar.update(frames_per_call(args[0].shape[2], bar.n))
 
     handle = module.register_forward_hook(count)
@@ -148,6 +153,51 @@ def _vae_progress(module: torch.nn.Module, total: int, colour: str, frames_per_c
     finally:
         handle.remove()
         bar.close()
+
+
+@contextmanager
+def _block_progress(diffusion_model: torch.nn.Module):
+    """Shows a bar over the transformer blocks of each model pass while
+    sampling, beneath ComfyUI's own per-step bar. Each step is one pass, or
+    two when CFG's cond and uncond halves aren't batched together; each pass
+    gets its own bar, saying which half it's running.
+
+    A pass's bar closes the moment its last block finishes: tqdm only clears
+    a nested bar's line properly while the bar above it is still open, and
+    ComfyUI closes the step bar as soon as the last step ends."""
+    blocks = [*diffusion_model.blocks, *diffusion_model.vace_blocks]
+    bar = None
+
+    def close() -> None:
+        nonlocal bar
+        if bar is not None:
+            bar.close()
+            bar = None
+
+    def start(_module, _args, kwargs) -> None:
+        nonlocal bar
+        close()
+        halves = kwargs["transformer_options"]["cond_or_uncond"]
+        bar = tqdm(total=len(blocks), unit="block", colour="magenta", leave=False, dynamic_ncols=True,
+                   desc="+".join(("cond", "uncond")[h] for h in sorted(halves)))
+
+    # Must return None: anything else replaces the block's output.
+    def count(_module, args, _output) -> None:
+        if bar is None:
+            return
+        _wait_for(args[0])
+        bar.update()
+        if bar.n == bar.total:
+            close()
+
+    handles = [diffusion_model.blocks[0].register_forward_pre_hook(start, with_kwargs=True)]
+    handles += [block.register_forward_hook(count) for block in blocks]
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+        close()
 
 
 @dataclass
@@ -247,19 +297,20 @@ def run_vace_transition(
             )
 
         stage(f"sampling ({steps} steps)", "magenta")
-        (samples,) = _call(
-            _node_classes["KSampler"],
-            model=loaded_model,
-            seed=seed,
-            steps=steps,
-            cfg=config.CFG,
-            sampler_name=config.SAMPLER_NAME,
-            scheduler=config.SCHEDULER,
-            positive=positive,
-            negative=negative,
-            latent_image=latent,
-            denoise=config.DENOISE,
-        )
+        with _block_progress(loaded_model.model.diffusion_model):
+            (samples,) = _call(
+                _node_classes["KSampler"],
+                model=loaded_model,
+                seed=seed,
+                steps=steps,
+                cfg=config.CFG,
+                sampler_name=config.SAMPLER_NAME,
+                scheduler=config.SCHEDULER,
+                positive=positive,
+                negative=negative,
+                latent_image=latent,
+                denoise=config.DENOISE,
+            )
 
         # Same again before decoding: with the VAE on the GPU, the UNet would
         # otherwise still be there, and ComfyUI's estimate of how much room
