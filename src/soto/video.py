@@ -52,12 +52,13 @@ def probe(path: Path) -> ClipInfo:
     )
 
 
-def _read_frames(path: Path, start_frame: int, n_frames: int, width: int, height: int) -> np.ndarray:
+def _read_frames(path: Path, start_frame: int, n_frames: int, width: int, height: int,
+                 flags: str = "area") -> np.ndarray:
     end_frame = start_frame + n_frames - 1
     select = f"between(n\\,{start_frame}\\,{end_frame})"
     cmd = [
         "ffmpeg", "-loglevel", "error", "-i", str(path),
-        "-vf", f"select='{select}',scale={width}:{height}:flags=area",
+        "-vf", f"select='{select}',scale={width}:{height}:flags={flags}",
         "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
     raw = subprocess.run(cmd, capture_output=True, check=True).stdout
@@ -308,8 +309,9 @@ def splice_output(
     _concat(parts, output_path)
 
 
-def read_frames(path: Path, start_frame: int, n_frames: int, width: int, height: int) -> np.ndarray:
-    return _read_frames(path, start_frame, n_frames, width, height)
+def read_frames(path: Path, start_frame: int, n_frames: int, width: int, height: int,
+                flags: str = "area") -> np.ndarray:
+    return _read_frames(path, start_frame, n_frames, width, height, flags)
 
 
 def parse_hex_color(value: str) -> tuple[int, int, int]:
@@ -466,5 +468,115 @@ def _mux_audio(video_only: Path, audio_source: Path, output_path: Path, offset_s
         "ffmpeg", "-y", "-loglevel", "error", "-i", str(video_only),
         *(["-itsoffset", f"{offset_s:.6f}"] if offset_s else []), "-i", str(audio_source),
         "-map", "0:v", "-map", "1:a?", "-c:v", "copy", "-c:a", "copy", str(output_path),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+# A source rect inside a larger canvas, as (x0, y0, x1, y1) in pixels, x1/y1 exclusive.
+Rect = tuple[int, int, int, int]
+
+
+def _inner_rect(rect: Rect, width: int, height: int, seam: float) -> tuple[float, float, float, float]:
+    """`rect` shrunk by `seam` on each side that has a border to fill, i.e.
+    isn't flush with the canvas edge."""
+    x0, y0, x1, y1 = rect
+    return (
+        x0 + seam if x0 > 0 else x0,
+        y0 + seam if y0 > 0 else y0,
+        x1 - seam if x1 < width else x1,
+        y1 - seam if y1 < height else y1,
+    )
+
+
+def build_outpaint_batch(
+    given: np.ndarray, frames: np.ndarray, width: int, height: int, rect: Rect, seam_px: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Builds the (control_video, control_mask) pair for outpainting:
+    `frames` (already scaled to `rect`'s size) placed on a white canvas,
+    masked (1 = generate) everywhere outside `rect` and `seam_px` into it,
+    so VACE redraws a band across the seam for the composite to blend over.
+    `given` are whole canvases from the previous window, kept as they are
+    (mask 0) so the new borders carry on from the old ones."""
+    x0, y0, x1, y1 = rect
+    n_given = given.shape[0]
+    placed = np.ones((frames.shape[0], height, width, 3), dtype=np.float32)
+    placed[:, y0:y1, x0:x1] = frames
+    video = np.concatenate([given, placed], axis=0)
+
+    ix0, iy0, ix1, iy1 = (int(v) for v in _inner_rect(rect, width, height, seam_px))
+    mask = np.ones((video.shape[0], height, width), dtype=np.float32)
+    mask[:n_given] = 0.0
+    mask[n_given:, iy0:iy1, ix0:ix1] = 0.0
+    return torch.from_numpy(video), torch.from_numpy(mask)
+
+
+def _seam_alpha(rect: Rect, width: int, height: int, seam: float) -> np.ndarray:
+    """(h, w, 1) weight of the real footage over `rect`: 1 in the middle,
+    ramping to 0 at each edge that borders generated picture over `seam` px."""
+    x0, y0, x1, y1 = rect
+
+    def ramp(n: int, lo_open: bool, hi_open: bool) -> np.ndarray:
+        d = np.arange(n, dtype=np.float32) + 0.5
+        a = np.ones(n, dtype=np.float32)
+        if seam > 0:
+            if lo_open:
+                a = np.minimum(a, d / seam)
+            if hi_open:
+                a = np.minimum(a, d[::-1] / seam)
+        return np.clip(a, 0.0, 1.0)
+
+    ax = ramp(x1 - x0, x0 > 0, x1 < width)
+    ay = ramp(y1 - y0, y0 > 0, y1 < height)
+    return np.minimum(ay[:, None], ax[None, :])[..., None]
+
+
+def composite_outpaint(
+    canvases: list[np.ndarray], clip: Path, rect: Rect, width: int, height: int, seam: float,
+    chunk: int = 32,
+) -> Iterable[np.ndarray]:
+    """Yields output frames at `width`x`height`: each generated canvas (uint8,
+    any resolution) scaled up, with the clip's own frame, read straight from
+    the source at `rect`'s size, laid over `rect` and feathered into the
+    generated picture across `seam` px."""
+    x0, y0, x1, y1 = rect
+    rw, rh = x1 - x0, y1 - y0
+    alpha = _seam_alpha(rect, width, height, seam)
+    for start in range(0, len(canvases), chunk):
+        batch = np.stack(canvases[start:start + chunk]).astype(np.float32) / 255.0
+        up = _scale_frames(batch, width, height)
+        real = _read_frames(clip, start, batch.shape[0], rw, rh, flags="lanczos")
+        up[:, y0:y1, x0:x1] = alpha * real + (1.0 - alpha) * up[:, y0:y1, x0:x1]
+        yield from up
+
+
+def write_outpaint(frames: Iterable[np.ndarray], fps: float, width: int, height: int,
+                   audio_source: Path, output_path: Path) -> None:
+    """Encodes `frames` (already at `width`x`height`) with `audio_source`'s audio."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="soto-expand-"))
+    video_only = tmp_dir / "video_only.mp4"
+    _write_frames_to_video(frames, fps, width, height, video_only)
+    _mux_audio(video_only, audio_source, output_path)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def blur_fill(input_path: Path, output_path: Path, width: int, height: int, rect: Rect) -> None:
+    """The no-model fill: the clip scaled to `rect` over a heavily blurred,
+    slightly darkened copy of itself scaled to cover `width`x`height`. Audio
+    is copied as-is."""
+    x0, y0, x1, y1 = rect
+    sigma = max(4.0, 0.04 * width)
+    graph = (
+        "[0:v]split[bg][fg];"
+        f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase:flags=area,crop={width}:{height},"
+        f"gblur=sigma={sigma:.1f},eq=brightness=-0.05[bgb];"
+        f"[fg]scale={x1 - x0}:{y1 - y0}:flags=lanczos[fgs];"
+        f"[bgb][fgs]overlay={x0}:{y0},setsar=1[v]"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error", "-i", str(input_path),
+        "-filter_complex", graph, "-map", "[v]", "-map", "0:a?",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy", str(output_path),
     ]
     subprocess.run(cmd, check=True)

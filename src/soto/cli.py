@@ -855,5 +855,218 @@ def dream(
         print(f"Done: {output}")
 
 
+def _parse_size(value: str) -> tuple[int, int]:
+    from soto import video
+
+    try:
+        w, h = (int(v) for v in value.lower().split("x"))
+    except ValueError:
+        raise typer.BadParameter(f"expected WIDTHxHEIGHT, e.g. 1920x1080, not {value!r}", param_hint="--size")
+    if w < 16 or h < 16:
+        raise typer.BadParameter("must be at least 16x16", param_hint="--size")
+    return video.even_size(w, h)
+
+
+def _expand_rect(src_w: int, src_h: int, out_w: int, out_h: int, fit: str) -> tuple[int, int, int, int]:
+    """Where the source sits in the output, centred: as large as fits for
+    'contain', at its own size for 'native'."""
+    from soto import video
+
+    if fit == "contain":
+        scale = min(out_w / src_w, out_h / src_h)
+        rw, rh = video.even_size(round(src_w * scale), round(src_h * scale))
+    else:
+        if src_w > out_w or src_h > out_h:
+            raise typer.BadParameter(
+                f"the clip ({src_w}x{src_h}) is larger than {out_w}x{out_h}; use --fit contain to scale it down",
+                param_hint="--size",
+            )
+        rw, rh = src_w, src_h
+    x0, y0 = (out_w - rw) // 2, (out_h - rh) // 2
+    return x0, y0, x0 + rw, y0 + rh
+
+
+def _scale_rect(rect: tuple[int, int, int, int], sx: float, sy: float, w: int, h: int) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = rect
+    return (max(0, round(x0 * sx)), max(0, round(y0 * sy)), min(w, round(x1 * sx)), min(h, round(y1 * sy)))
+
+
+def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int, overlap: int,
+                    model: str, prompt: str, steps: int, seed: int, log: RunLog) -> list:
+    """Outpaints the whole clip at working resolution, `window` frames per
+    VACE run, each run after the first given the previous one's last
+    `overlap` canvases. Returns one uint8 canvas per frame of the clip."""
+    import numpy as np
+
+    from soto import comfy_engine, video
+
+    x0, y0, x1, y1 = rect
+    rw, rh = x1 - x0, y1 - y0
+    # The rect is usually a downscale of the source, but not for low-res clips.
+    flags = "area" if rw <= info.width else "lanczos"
+    n_windows = 1 + max(0, -(-(info.n_frames - window) // (window - overlap)))
+    canvases: list = []
+    start = 0
+    for i in range(n_windows):
+        given = (np.stack(canvases[-overlap:]).astype(np.float32) / 255.0 if canvases and overlap
+                 else np.zeros((0, height, width, 3), dtype=np.float32))
+        n_new = min(window - given.shape[0], info.n_frames - start)
+        frames = video.read_frames(clip, start, n_new, rw, rh, flags=flags)
+        # Round the run up to VACE's length stride with copies of the last
+        # frame, and drop what they generate.
+        length = given.shape[0] + n_new
+        pad = (-(length - 1)) % config.VACE_LENGTH_STRIDE
+        if pad:
+            frames = np.concatenate([frames, np.repeat(frames[-1:], pad, axis=0)], axis=0)
+        control_video, control_mask = video.build_outpaint_batch(
+            given, frames, width, height, rect, config.EXPAND_SEAM_PX
+        )
+        run_seed = (seed + i) % 2**32
+        print(f"[{i + 1}/{n_windows}] Running Wan2.1-VACE ({model}) on frames {start}-{start + n_new - 1}...")
+        with log.run(window=i + 1, seed=run_seed, steps=steps, frames=[start, start + n_new],
+                     given_frames=given.shape[0], padded_frames=pad, length=length + pad):
+            result = comfy_engine.run_vace_transition(
+                control_video=control_video,
+                control_mask=control_mask,
+                width=width,
+                height=height,
+                length=length + pad,
+                model=model,
+                prompt=prompt,
+                negative_prompt=config.DEFAULT_NEGATIVE_PROMPT,
+                steps=steps,
+                seed=run_seed,
+            )
+        new = result.frames[given.shape[0]:length].cpu().numpy()
+        # Kept as uint8: a long clip's worth of float canvases adds up.
+        canvases.extend(np.clip(new * 255.0 + 0.5, 0, 255).astype(np.uint8))
+        start += n_new
+    return canvases
+
+
+@app.command()
+def expand(
+    clip: Path = typer.Argument(..., exists=True, help="Clip to expand."),
+    output: Path = typer.Option(..., "-o", "--output", help="Output video path."),
+    size: str = typer.Option(..., "--size", help="Output resolution, WIDTHxHEIGHT, e.g. 1920x1080."),
+    fill: str = typer.Option(
+        "vace", "--fill",
+        help=f"How to fill the new edges: {list(config.EXPAND_FILLS)}. 'blur' is a blurred copy of the clip "
+        "behind it: no model, seconds to render.",
+    ),
+    fit: str = typer.Option(
+        "contain", "--fit",
+        help=f"How the clip sits in the output, centred: {list(config.EXPAND_FITS)}. 'contain' scales it as "
+        "large as fits; 'native' keeps its own size.",
+    ),
+    window: int = typer.Option(config.EXPAND_WINDOW, "--window", min=2, help="Frames per VACE run."),
+    overlap: int = typer.Option(
+        config.EXPAND_OVERLAP, "--overlap", min=0,
+        help="Generated frames from the end of each run given to the next, so the edges carry on across runs.",
+    ),
+    model: str = typer.Option(
+        config.DEFAULT_MODEL, "--model",
+        help=f"Which checkpoint to use: {list(config.MODELS)}.",
+    ),
+    prompt: str = typer.Option(
+        config.DEFAULT_EXPAND_PROMPT, "--prompt", help="Positive prompt guiding the generated edges."
+    ),
+    steps: int = typer.Option(None, "--steps", help=_STEPS_HELP),
+    preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
+    seed: int = typer.Option(None, "--seed", help="Random seed (default: random each run)."),
+    export_generated: Path = typer.Option(
+        None, "--export-generated", dir_okay=False,
+        help="Also write the model's raw canvases, scaled to the output size, before the real footage is laid "
+        "back over the middle -- for blending by hand in an editor.",
+    ),
+    no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
+) -> None:
+    """Grow a clip's frame to a larger resolution, generating new picture
+    around its edges from what's in the frame, with the original centred."""
+    if fill not in config.EXPAND_FILLS:
+        raise typer.BadParameter(f"must be one of {list(config.EXPAND_FILLS)}", param_hint="--fill")
+    if fit not in config.EXPAND_FITS:
+        raise typer.BadParameter(f"must be one of {list(config.EXPAND_FITS)}", param_hint="--fit")
+    if model not in config.MODELS:
+        raise typer.BadParameter(f"--model must be one of {list(config.MODELS)}")
+    if overlap >= window:
+        raise typer.BadParameter("must be less than --window", param_hint="--overlap")
+    out_w, out_h = _parse_size(size)
+
+    import numpy as np
+
+    from soto import video
+
+    log = RunLog("expand", enabled=not no_metadata)
+    with log.guard(output):
+        print(f"Probing {clip}...")
+        info = video.probe(clip)
+        conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
+        clip, info = _conform_clip(clip, info, conform_dir, log, "clip")
+        fps = info.fps
+        rect = _expand_rect(info.width, info.height, out_w, out_h, fit)
+        if rect == (0, 0, out_w, out_h):
+            raise typer.BadParameter(
+                f"the clip already fills {out_w}x{out_h} with --fit {fit}: nothing to expand", param_hint="--size"
+            )
+        log.settings.update({
+            "fill": fill,
+            "fit": fit,
+            "output_resolution": [out_w, out_h],
+            "source_rect": list(rect),
+        })
+        print(f"  {info.width}x{info.height} -> {out_w}x{out_h}, clip at {rect[2] - rect[0]}x{rect[3] - rect[1]} "
+              f"from ({rect[0]}, {rect[1]})")
+
+        if fill == "blur":
+            ignored = [flag for flag, value in (("--steps", steps), ("--preview", preview), ("--seed", seed),
+                                                ("--export-generated", export_generated)) if value is not None]
+            if ignored:
+                print(f"  note: {', '.join(ignored)} only apply to --fill vace; ignored")
+            log.settings["seed"] = None
+            print("Rendering blur fill...")
+            with log.run(fill="blur"):
+                video.blur_fill(clip, output, out_w, out_h, rect)
+            log.segment("real", 0, info.n_frames, "clip, expanded (blur)", source="clip",
+                        source_frames=[0, info.n_frames])
+            shutil.rmtree(conform_dir, ignore_errors=True)
+            log.write(output, fps)
+            print(f"Done: {output}")
+            return
+
+        area, steps = _resolve_quality(preview, steps, log)
+        width, height = _fit_working_resolution(out_w, out_h, area)
+        work_rect = _scale_rect(rect, width / out_w, height / out_h, width, height)
+        _log_vace_settings(log, model=model, prompt=prompt, steps=steps, preview=preview, width=width,
+                           height=height, context=0.0, crossfade=0, export_generated=export_generated)
+        del log.settings["context_s"], log.settings["crossfade_frames"]
+        log.settings.update({
+            "source_rect_working": list(work_rect),
+            "window": window,
+            "overlap": overlap,
+            "seam_px": config.EXPAND_SEAM_PX,
+        })
+        resolved_seed = _resolve_seed(seed, log)
+        log.settings["seed_note"] = "window i (from 0) uses seed + i"
+        print(f"  working resolution {width}x{height}{_preview_note(preview)}, "
+              f"windows of {window} frames overlapping by {overlap}")
+        print(f"seed={resolved_seed}, steps={steps}")
+
+        canvases = _expand_windows(clip, info, width, height, work_rect, window, overlap, model, prompt, steps,
+                                   resolved_seed, log)
+
+        print("Compositing final output...")
+        seam = config.EXPAND_SEAM_PX * out_w / width
+        video.write_outpaint(video.composite_outpaint(canvases, clip, rect, out_w, out_h, seam),
+                             fps, out_w, out_h, clip, output)
+        if export_generated is not None:
+            print(f"Exporting generated frames to {export_generated}...")
+            video.write_outpaint((c.astype(np.float32) / 255.0 for c in canvases),
+                                 fps, out_w, out_h, clip, export_generated)
+        log.segment("real", 0, info.n_frames, "clip, expanded", source="clip", source_frames=[0, info.n_frames])
+        shutil.rmtree(conform_dir, ignore_errors=True)
+        _print_done(output, resolved_seed, preview, log, fps)
+
+
 if __name__ == "__main__":
     app()

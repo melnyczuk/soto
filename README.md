@@ -167,6 +167,39 @@ edges. They now run as a single resample on the GPU. The original went through
 uint8 and PIL for each move, and its truncation darkened every frame by about
 half a level per move.
 
+## Expanding the frame
+
+`expand` grows a clip to a bigger output resolution, with the original
+centred and new picture generated around it from what's in the frame
+(outpainting):
+
+```bash
+uv run soto expand clip.mp4 -o output.mp4 --size 1920x1080
+```
+
+`--fit contain` (the default) scales the clip as large as it fits in
+`--size`, so only the edges along the mismatched axis are filled. For
+example, 4:3 into 16:9 fills the sides. `--fit native` keeps the clip at its
+own size, so it gets a border on every side.
+
+The default `--fill vace` uses the same Wan2.1-VACE model as everything
+else, with a spatial mask instead of a temporal one. Each frame sits on a
+canvas at the output's aspect ratio, and VACE generates everything outside
+it, plus a 16px band just inside. It works on whole runs of frames at once,
+so the new edges move with the footage instead of flickering frame to frame.
+Runs are `--window` frames long (81 by default). Each one after the first is
+given the previous run's last `--overlap` generated frames (8 by default),
+so the edges carry on across runs. Run `i` uses `--seed + i`. The model
+works at the usual ~832x480 working resolution. The result is scaled up to
+`--size`, and the original footage is laid back over the middle at full
+quality and feathered into the generated edges across the 16px band. So
+only the new edges are soft. `--model`, `--prompt`, `--steps`, `--preview`
+and `--seed` work as in the other commands. `--export-generated` writes the
+model's raw canvases, before the original is laid back over them.
+
+`--fill blur` uses no model: the clip goes over a blurred, slightly darkened
+copy of itself scaled to fill the frame. It renders in seconds.
+
 ## Softening the seams
 
 `transition`, `bridge` and `extend` all take `--crossfade N`: instead of

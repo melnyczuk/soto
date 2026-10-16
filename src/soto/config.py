@@ -126,3 +126,19 @@ PREVIEW_TIERS: dict[str, tuple[int | None, int]] = {
 # Wan's causal VAE has temporal stride 4 (+1 leading frame); WanVaceToVideo's
 # `length` should satisfy (length - 1) % 4 == 0 for a clean latent frame count.
 VACE_LENGTH_STRIDE = 4
+
+# `soto expand` (outpainting). Each VACE run covers EXPAND_WINDOW frames, 81
+# being VACE's native clip length; every run after the first is given the
+# previous run's last EXPAND_OVERLAP generated frames, whole, so the new
+# borders carry on from the old ones instead of being reinvented each window.
+# EXPAND_SEAM_PX (at working resolution) is how far the generated area
+# reaches into the real footage, for the composite to feather across.
+EXPAND_WINDOW = 81
+EXPAND_OVERLAP = 8
+EXPAND_SEAM_PX = 16
+EXPAND_FILLS = ("vace", "blur")
+EXPAND_FITS = ("contain", "native")
+DEFAULT_EXPAND_PROMPT = (
+    "the scene continuing naturally beyond the edges of the frame, consistent lighting and perspective, "
+    "coherent scene, smooth continuous motion, high quality"
+)
