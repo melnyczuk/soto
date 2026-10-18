@@ -292,6 +292,11 @@ def doctor() -> None:
     print(f"[{'ok' if te_ok else 'FAIL'}] models/text_encoders/{config.TEXT_ENCODER_FILENAME} (run `soto setup`)")
     ok &= te_ok
 
+    for kind, path in (("depth", config.DEPTH_MODEL_DIR), ("segment", config.SEGMENT_MODEL_DIR)):
+        present = (path / "config.json").is_file()
+        print(f"[{'ok' if present else 'warn'}] models/{kind}/{path.name} for `expand --fill dream` "
+              "(run `soto setup`)")
+
     # Only `soto dream` needs these, so their absence is a warning, not a failure.
     dreams = sorted(p.stem for p in config.PIX2PIXHD_DIR.glob("*.pth"))
     print(f"[{'ok' if dreams else 'warn'}] models/pix2pixhd/ checkpoints for `soto dream`: {', '.join(dreams) or 'none'}")
@@ -1070,13 +1075,16 @@ def _scale_rect(rect: tuple[int, int, int, int], sx: float, sy: float, w: int, h
 
 
 def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int, overlap: int,
-                    model: str, prompt: str, steps: int, seed: int, log: RunLog) -> list:
+                    model: str, prompt: str, steps: int, seed: int, log: RunLog, dream=None) -> list:
     """Outpaints the whole clip at working resolution, `window` frames per
     VACE run, each run after the first given the previous one's last
-    `overlap` canvases. Returns one uint8 canvas per frame of the clip."""
+    `overlap` canvases. Returns one uint8 canvas per frame of the clip.
+    `dream`, a (Focus, DreamLook, QuiltTrack or None) triple, starts VACE
+    from the dream fill instead of a blank border."""
     import numpy as np
 
     from soto import comfy_engine, video
+    from soto import dream as dreaming
 
     x0, y0, x1, y1 = rect
     rw, rh = x1 - x0, y1 - y0
@@ -1096,9 +1104,19 @@ def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int
         pad = (-(length - 1)) % config.VACE_LENGTH_STRIDE
         if pad:
             frames = np.concatenate([frames, np.repeat(frames[-1:], pad, axis=0)], axis=0)
-        control_video, control_mask = video.build_outpaint_batch(
-            given, frames, width, height, rect, config.EXPAND_SEAM_PX
-        )
+        if dream:
+            focus, look, quilt = dream
+            window_focus = focus[start:start + n_new].padded(pad)
+            levels = dreaming.blur_levels(window_focus, rect, width, height, look)
+            canvas, weight = dreaming.render(frames, window_focus, levels, rect, width, height, look, quilt,
+                                             start)
+            control_video, control_mask = video.build_dream_outpaint_batch(
+                given, canvas, weight, config.EXPAND_DREAM_MASK
+            )
+        else:
+            control_video, control_mask = video.build_outpaint_batch(
+                given, frames, width, height, rect, config.EXPAND_SEAM_PX
+            )
         run_seed = (seed + i) % 2**32
         print(f"[{i + 1}/{n_windows}] Running Wan2.1-VACE ({model}) on frames {start}-{start + n_new - 1}...")
         with log.run(window=i + 1, seed=run_seed, steps=steps, frames=[start, start + n_new],
@@ -1130,7 +1148,56 @@ def expand(
     fill: str = typer.Option(
         "vace", "--fill",
         help=f"How to fill the new edges: {list(config.EXPAND_FILLS)}. 'blur' is a blurred copy of the clip "
-        "behind it: no model, seconds to render.",
+        "behind it: no model, seconds to render. 'dream' keeps the clip's subject sharp and blurs everything "
+        "else more the further it is from it, out through the clip's own background into the new edges, "
+        "with an anamorphic-lens look: wide blur, light streaks. No model, a minute or so to render. "
+        "'vace-dream' starts VACE from that instead of a blank border, with a dreamy prompt, so the model "
+        "restyles the blur and leaves the subject alone.",
+    ),
+    dream_strength: float = typer.Option(
+        config.DREAM_STRENGTH, "--dream-strength", min=0.1,
+        help="--fill dream and vace-dream: how wide the blur is at the clip's edge (1 = default).",
+    ),
+    feather: float = typer.Option(
+        config.DREAM_FEATHER, "--feather", min=0.01, max=0.5,
+        help="--fill dream and vace-dream: how far in from the clip's edges the blur reaches full strength, "
+        "as a fraction of the output's short side.",
+    ),
+    focus: str = typer.Option(
+        config.DREAM_FOCUS_MODES[0], "--focus",
+        help=f"--fill dream and vace-dream: how the subject's found, {list(config.DREAM_FOCUS_MODES)}. 'segment' "
+        "cuts out the objects that are the frame's focus with SlimSAM and blurs the rest by how far it is in "
+        "depth, like a lens; 'depth' does the same with depth alone, which can't tell a subject from the ground "
+        "it's on; 'heuristic' guesses from colour, motion and detail, and blurs by distance across the frame.",
+    ),
+    depth_falloff: float = typer.Option(
+        config.DREAM_DEPTH_FALLOFF, "--depth-falloff", min=0.0, max=1.0,
+        help="--fill dream and vace-dream with --focus segment or depth: how far in depth from the subject the background "
+        "takes to blur, as a fraction of the frame's depth range. Lower is a shallower depth of field; 0 leaves "
+        "the whole clip sharp but for --feather.",
+    ),
+    focus_falloff: float = typer.Option(
+        config.DREAM_FALLOFF, "--focus-falloff", min=0.0, max=1.0,
+        help="--fill dream and vace-dream with --focus heuristic: how far from the subject the clip's own "
+        "background takes to blur, as a fraction of the output's short side. 0 leaves the whole clip sharp but "
+        "for --feather.",
+    ),
+    streak: float = typer.Option(
+        config.DREAM_STREAK, "--streak", min=0.0, max=1.0,
+        help="--fill dream and vace-dream: opacity of the horizontal light streaks.",
+    ),
+    deform: float = typer.Option(
+        config.DREAM_DEFORM, "--deform", min=0.0, max=4.0,
+        help="--fill dream and vace-dream: how much the new edges bend, as at the edges of an anamorphic lens: "
+        "stretched a little outward and swirled a little round the centre, more the further they are in depth "
+        "from the subject (1 = default, 0 = none).",
+    ),
+    texture: str = typer.Option(
+        config.DREAM_TEXTURES[0], "--texture",
+        help=f"--fill dream and vace-dream: what goes outside the clip before it's blurred, "
+        f"{list(config.DREAM_TEXTURES)}. 'quilt' tiles it with patches of the clip's background, matched to "
+        "each other and to the clip's edge, as content-aware fill does, cut from each frame so they move with "
+        "the footage (--seed picks the layout). 'mirror' reflects the clip outward.",
     ),
     fit: str = typer.Option(
         "contain", "--fit",
@@ -1163,6 +1230,10 @@ def expand(
     around its edges from what's in the frame, with the original centred."""
     if fill not in config.EXPAND_FILLS:
         raise typer.BadParameter(f"must be one of {list(config.EXPAND_FILLS)}", param_hint="--fill")
+    if focus not in config.DREAM_FOCUS_MODES:
+        raise typer.BadParameter(f"must be one of {list(config.DREAM_FOCUS_MODES)}", param_hint="--focus")
+    if texture not in config.DREAM_TEXTURES:
+        raise typer.BadParameter(f"must be one of {list(config.DREAM_TEXTURES)}", param_hint="--texture")
     if fit not in config.EXPAND_FITS:
         raise typer.BadParameter(f"must be one of {list(config.EXPAND_FITS)}", param_hint="--fit")
     if model not in config.MODELS:
@@ -1173,6 +1244,7 @@ def expand(
 
     import numpy as np
 
+    from soto import dream as dreaming
     from soto import video
 
     log = RunLog("expand", enabled=not no_metadata)
@@ -1196,22 +1268,53 @@ def expand(
         print(f"  {info.width}x{info.height} -> {out_w}x{out_h}, clip at {rect[2] - rect[0]}x{rect[3] - rect[1]} "
               f"from ({rect[0]}, {rect[1]})")
 
-        if fill == "blur":
-            ignored = [flag for flag, value in (("--steps", steps), ("--preview", preview), ("--seed", seed),
+        look = dreaming.DreamLook(strength=dream_strength, feather=feather, falloff=focus_falloff, streak=streak,
+                                  depth_falloff=depth_falloff, deform=deform)
+        look_settings = {"dream_strength": dream_strength, "feather": feather, "focus": focus,
+                         **({"depth_falloff": depth_falloff} if focus == "depth" else {"focus_falloff": focus_falloff}),
+                         "streak": streak, "deform": deform, "texture": texture}
+
+        def find_subject():
+            print(f"Finding the subject ({focus})...")
+            return dreaming.focus_maps(clip, info, depth=focus != "heuristic", segment=focus == "segment")
+
+        def plan_quilt(subject, seed: int):
+            if texture != "quilt":
+                return None
+            print("Quilting the new edges...")
+            return dreaming.plan_quilt(clip, info, subject, rect, out_w, out_h, seed)
+
+        if fill in ("blur", "dream"):
+            ignored = [flag for flag, value in (("--steps", steps), ("--preview", preview),
                                                 ("--export-generated", export_generated)) if value is not None]
+            if fill == "blur" and seed is not None:
+                ignored.append("--seed")
             if ignored:
-                print(f"  note: {', '.join(ignored)} only apply to --fill vace; ignored")
-            log.settings["seed"] = None
-            print("Rendering blur fill...")
-            with log.run(fill="blur"):
-                video.blur_fill(clip, output, out_w, out_h, rect)
-            log.segment("real", 0, info.n_frames, "clip, expanded (blur)", source="clip",
+                print(f"  note: {', '.join(ignored)} only apply to --fill vace and vace-dream; ignored")
+            log.settings["seed"] = resolved_seed = None
+            if fill == "dream":
+                log.settings.update(look_settings)
+                resolved_seed = _resolve_seed(seed, log) if texture == "quilt" else None
+                with log.run(fill="dream"):
+                    subject = find_subject()
+                    quilt = plan_quilt(subject, resolved_seed)
+                    print("Rendering dream fill...")
+                    video.write_outpaint(dreaming.dream_frames(clip, info, subject, rect, out_w, out_h, look, quilt),
+                                         fps, out_w, out_h, clip, output)
+            else:
+                print("Rendering blur fill...")
+                with log.run(fill="blur"):
+                    video.blur_fill(clip, output, out_w, out_h, rect)
+            log.segment("real", 0, info.n_frames, f"clip, expanded ({fill})", source="clip",
                         source_frames=[0, info.n_frames])
             shutil.rmtree(conform_dir, ignore_errors=True)
             log.write(output, fps)
-            print(f"Done: {output}")
+            print(f"Done: {output}" + (f" (seed={resolved_seed})" if resolved_seed is not None else ""))
             return
 
+        dream = fill == "vace-dream"
+        if dream and prompt == config.DEFAULT_EXPAND_PROMPT:
+            prompt = config.DEFAULT_DREAM_PROMPT
         area, steps = _resolve_quality(preview, steps, log)
         width, height = _fit_working_resolution(out_w, out_h, area)
         work_rect = _scale_rect(rect, width / out_w, height / out_h, width, height)
@@ -1223,6 +1326,7 @@ def expand(
             "window": window,
             "overlap": overlap,
             "seam_px": config.EXPAND_SEAM_PX,
+            **({**look_settings, "dream_mask": config.EXPAND_DREAM_MASK} if dream else {}),
         })
         resolved_seed = _resolve_seed(seed, log)
         log.settings["seed_note"] = "window i (from 0) uses seed + i"
@@ -1230,13 +1334,20 @@ def expand(
               f"windows of {window} frames overlapping by {overlap}")
         print(f"seed={resolved_seed}, steps={steps}")
 
+        subject = quilt = None
+        if dream:
+            subject = find_subject()
+            quilt = plan_quilt(subject, resolved_seed)
         canvases = _expand_windows(clip, info, width, height, work_rect, window, overlap, model, prompt, steps,
-                                   resolved_seed, log)
+                                   resolved_seed, log, dream=(subject, look, quilt) if dream else None)
 
         print("Compositing final output...")
-        seam = config.EXPAND_SEAM_PX * out_w / width
-        video.write_outpaint(video.composite_outpaint(canvases, clip, rect, out_w, out_h, seam),
-                             fps, out_w, out_h, clip, output)
+        if dream:
+            frames = dreaming.composite(canvases, clip, subject, rect, out_w, out_h, look, quilt)
+        else:
+            frames = video.composite_outpaint(canvases, clip, rect, out_w, out_h,
+                                              config.EXPAND_SEAM_PX * out_w / width)
+        video.write_outpaint(frames, fps, out_w, out_h, clip, output)
         if export_generated is not None:
             print(f"Exporting generated frames to {export_generated}...")
             video.write_outpaint((c.astype(np.float32) / 255.0 for c in canvases),

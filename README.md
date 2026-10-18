@@ -293,6 +293,94 @@ model's raw canvases, before the original is laid back over them.
 `--fill blur` uses no model: the clip goes over a blurred, slightly darkened
 copy of itself scaled to fill the frame. It renders in seconds.
 
+`--fill dream` uses no model either ([`dream.py`](src/soto/dream.py)). It
+finds the clip's subject (or subjects) and keeps it sharp, and fills the new
+edges with real detail from the clip's own background, quilted together the
+way content-aware fill used to. Working outward from the clip's edges, each
+patch is cut from somewhere in the background whose overlap with what's
+already there (the clip, or the patches before it) matches well, and
+neighbouring patches crossfade into each other. Each frame's patches are cut
+from that frame, so the fill moves with the footage. The footage changes as
+it goes, so each second gets its own choice of patches, matched over a few
+of its frames and never taken from anywhere the subject is during it, and
+crossfades into the next. A patch keeps its source from one second to the
+next while it still fits, so steady footage keeps the same fill throughout.
+
+So it doesn't read as a repeating pattern, the patches sit on a jittered
+lattice and any of them can be flipped left to right. A source also gets
+more expensive each time it's used, and one from right beside where the
+patch goes costs more too (it would only repeat what's at the clip's edge).
+Each patch is drawn at random from the good matches, weighted toward the
+best. Patches never come from the subject, except where the fill carries on
+from a subject cut off by the clip's edge: there the subject carries on
+too. `--seed` picks the layout.
+`--texture mirror` reflects the clip outward instead.
+
+Then everything but the subject is blurred, more the further it is from it,
+lightly in the clip's own background and more toward the output's corners.
+The blur is wider than it is tall, and highlights smear into soft horizontal
+streaks, as through an anamorphic lens. It takes about a minute for 10s at
+1920x1536.
+
+The subject is found with two small models, both fetched by `soto setup`:
+[Depth Anything V2
+Small](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf)
+(Apache-2.0, ~95MB, in `models/depth/`) and
+[SlimSAM](https://huggingface.co/nielsr/slimsam-50-uniform), a pruned
+Segment Anything (Apache-2.0, ~110MB, in `models/segment/`). SAM is
+prompted all over every third frame, so every object in it is a candidate,
+and each is scored as a focus of the frame: how much it stands out in
+colour and motion, whether it's in front of what's around it in depth (an
+object is; the ground it stands on isn't), how cleanly it sits at one depth,
+a pull toward the centre, whether it runs along the frame's edge (a table
+top or a hillside does; a subject mostly doesn't), and whether it was the
+focus the frame before. The best is kept if it scores well enough at all,
+and any others nearly as good, so several subjects all stay sharp, and a
+landscape with no subject has none picked out of it. The frames between are
+blended from those either side.
+
+Everything is then blurred by how far it is in depth from the subject, as
+through a lens focused on it, so the ground the subject stands on stays
+sharp while the distance and the near foreground soften. Depth also steers
+the quilt: patches are matched on it as well as colour, so the new picture
+below a clip carries on from its nearest ground, not from the hills behind.
+And it bends the new edges, as the edges of an anamorphic lens do:
+stretched a little outward from the centre and swirled a little round it,
+nothing at the clip's edge and most toward the corners, and more the
+further each part is in depth from the subject. `--deform` scales it (0
+turns it off). Finding the subject takes about 10s per second of footage.
+
+`--focus depth` skips the segmentation and takes the subject to be what's
+near the colour-and-motion guess at about its depth. That's quicker, but
+depth can't tell a subject from the ground right where they meet, so on a
+long subject (a cow lying down) the far end of it can be taken for
+background, and a piece of it can turn up in the fill.
+
+Footage with no distance in it (a close-up of a dog nosing the grass) has
+nothing to blur away into, so the new edges there come out looking pasted
+on, whatever the settings.
+
+`--focus heuristic` skips the depth model and uses the guess alone, blurring
+by distance from it across the frame instead. That guess never takes more
+than about a fifth of the frame, so footage that's all texture (smoke,
+water) blurs out toward the edges as a whole.
+
+`--depth-falloff` is how far in depth from the subject the background takes
+to blur and bend (a fraction of the frame's depth range: lower is a shallower depth
+of field), and `--focus-falloff` the same across the frame for `--focus
+heuristic`. `--feather` is how far in from the clip's edges it reaches the
+edge's blur (a fraction of the output's short side), `--dream-strength` how
+wide the blur is, and `--streak` how bright the streaks are. Either falloff
+at 0 leaves the whole clip sharp but for the feather. If a batch of frames
+comes back from the GPU corrupted (it happens now and then, silently), it's
+noticed and redone.
+
+`--fill vace-dream` starts VACE from that dream fill instead of a blank
+border, with a dreamy prompt. The mask comes in with the blur: none on the
+subject, rising to 0.8 at the clip's edges and beyond, so VACE restyles the
+blur and leaves the subject alone. The result is laid back over the dream
+fill rendered at full size, fading in as the blur does.
+
 ## Softening the seams
 
 VACE regenerates its context frames along with the new ones, and `dream`

@@ -87,11 +87,25 @@ def download_small_weights() -> None:
         print(f"  {config.TEXT_ENCODER_FILENAME}: already present")
 
 
+def download_dream_models() -> None:
+    """The depth and segmentation models `expand --fill dream` finds the subject with."""
+    from huggingface_hub import snapshot_download
+
+    for repo, path in ((config.DEPTH_MODEL_REPO, config.DEPTH_MODEL_DIR),
+                       (config.SEGMENT_MODEL_REPO, config.SEGMENT_MODEL_DIR)):
+        if (path / "config.json").is_file():
+            print(f"  {path.name}: already present")
+            continue
+        print(f"  downloading {repo}...")
+        snapshot_download(repo, local_dir=path)
+
+
 def run() -> None:
     clone_vendor_repos()
     write_extra_model_paths()
-    print("Downloading VAE + text encoder...")
+    print("Downloading VAE, text encoder, depth and segmentation models...")
     download_small_weights()
+    download_dream_models()
     print("\nSetup complete. Run `soto doctor` to verify the environment.")
 
 

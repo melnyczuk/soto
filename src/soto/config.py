@@ -89,6 +89,14 @@ VAE_DTYPES = ("bf16", "fp16", "fp32")
 # or copied in by hand from the older soto-pix2pixHD project (its
 # checkpoints/<name>/latest_net_G.pth).
 PIX2PIXHD_DIR = MODELS_DIR / "pix2pixhd"
+# Depth Anything V2 Small, for finding the subject in `expand --fill dream`
+# and `vace-dream` (Apache-2.0; ~95MB, fetched by `soto setup`).
+DEPTH_MODEL_REPO = "depth-anything/Depth-Anything-V2-Small-hf"
+DEPTH_MODEL_DIR = MODELS_DIR / "depth" / "Depth-Anything-V2-Small-hf"
+# SlimSAM (Segment Anything, pruned), for cutting the subject out whole
+# (Apache-2.0; ~110MB, fetched by `soto setup`).
+SEGMENT_MODEL_REPO = "nielsr/slimsam-50-uniform"
+SEGMENT_MODEL_DIR = MODELS_DIR / "segment" / "slimsam-50-uniform"
 
 # `soto train` defaults. pix2pixHD's own: Adam at 2e-4 with beta1 0.5, held
 # for the first half of training and decayed linearly to 0 over the second,
@@ -169,8 +177,43 @@ VACE_LENGTH_STRIDE = 4
 EXPAND_WINDOW = 81
 EXPAND_OVERLAP = 8
 EXPAND_SEAM_PX = 16
-EXPAND_FILLS = ("vace", "blur")
+EXPAND_FILLS = ("vace", "blur", "dream", "vace-dream")
+# `--fill dream` and `vace-dream` defaults (see dream.py): blur strength
+# multiplier; how far in from the clip's edges the blur reaches full
+# strength, and how far from the subject the clip's background takes to
+# blur (with `--focus heuristic`), both as fractions of the output's short
+# side; highlight-streak opacity; with depth, how far in depth from the
+# subject the background takes to blur (as a fraction of the frame's depth
+# range); and how the subject's found.
+DREAM_STRENGTH = 1.0
+DREAM_FEATHER = 0.25
+DREAM_FALLOFF = 0.3
+DREAM_DEPTH_FALLOFF = 0.3
+DREAM_FOCUS_MODES = ("segment", "depth", "heuristic")
+DREAM_STREAK = 0.6
+DREAM_DEFORM = 1.0
+# How far in from the clip's edges the subject itself starts to blur, as a
+# fraction of the output's short side: it's otherwise kept sharp.
+DREAM_SUBJECT_EDGE = 0.12
+# Blur levels (see dream.py; 1 = 5% of a 16:9 clip's width, x --dream-strength):
+# the clip's own background away from the subject, the clip's edges, and the
+# far corners of the output. Then how much wider than tall the blur is.
+DREAM_BACKGROUND = 0.25
+DREAM_EDGE = 0.4
+DREAM_FAR = 0.6
+DREAM_ANAMORPHIC = 1.5
+# What `--fill dream` and `vace-dream` put outside the clip before blurring:
+# patches of its background quilted together, or the clip mirrored outward.
+DREAM_TEXTURES = ("quilt", "mirror")
 EXPAND_FITS = ("contain", "native")
+# `--fill vace-dream`: VACE starts from the dream fill rather than a white
+# border, masked up to EXPAND_DREAM_MASK (<1) as the blur comes in, so the
+# fill shows through for VACE to restyle and the subject is left alone.
+EXPAND_DREAM_MASK = 0.8
+DEFAULT_DREAM_PROMPT = (
+    "dreamy out-of-focus edges of the frame as shot through an anamorphic lens, soft horizontal light "
+    "streaks, glowing bokeh, heavily blurred, smooth gradients, soft diffusion"
+)
 DEFAULT_EXPAND_PROMPT = (
     "the scene continuing naturally beyond the edges of the frame, consistent lighting and perspective, "
     "coherent scene, smooth continuous motion, high quality"

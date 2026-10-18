@@ -446,6 +446,19 @@ def build_outpaint_batch(
     return torch.from_numpy(video), torch.from_numpy(mask)
 
 
+def build_dream_outpaint_batch(
+    given: np.ndarray, canvases: np.ndarray, weight: np.ndarray, generate: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The (control_video, control_mask) pair for `--fill vace-dream`:
+    `canvases` are already whole dream-filled frames, masked at `generate`
+    times `weight` (n, h, w, 0-1, how far each pixel is blurred from the
+    clip as it was), so VACE restyles the blur and leaves the subject be.
+    `given` are kept as they are, as in build_outpaint_batch."""
+    video = np.concatenate([given, canvases], axis=0)
+    mask = np.concatenate([np.zeros(given.shape[:3], dtype=np.float32), generate * weight], axis=0)
+    return torch.from_numpy(video), torch.from_numpy(mask.astype(np.float32))
+
+
 def _seam_alpha(rect: Rect, width: int, height: int, seam: float) -> np.ndarray:
     """(h, w, 1) weight of the real footage over `rect`: 1 in the middle,
     ramping to 0 at each edge that borders generated picture over `seam` px."""
