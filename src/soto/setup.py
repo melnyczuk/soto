@@ -100,12 +100,34 @@ def download_dream_models() -> None:
         snapshot_download(repo, local_dir=path)
 
 
-def run() -> None:
+def download_flux_models() -> None:
+    """FLUX.1 Fill and its text encoders and VAE, for `expand --fill dream
+    --texture flux`."""
+    from huggingface_hub import hf_hub_download
+
+    for repo, remote, dest in (
+        (config.FLUX_FILL_REPO, config.FLUX_FILL_FILENAME, config.MODELS_DIR / config.FLUX_FILL_FILENAME),
+        (config.FLUX_T5_REPO, config.FLUX_T5_FILENAME, config.TEXT_ENCODERS_DIR / config.FLUX_T5_FILENAME),
+        (config.FLUX_CLIP_REPO, config.FLUX_CLIP_FILENAME, config.TEXT_ENCODERS_DIR / config.FLUX_CLIP_FILENAME),
+        (config.FLUX_VAE_REPO, config.FLUX_VAE_REMOTE_PATH, config.VAE_DIR / config.FLUX_VAE_FILENAME),
+    ):
+        if dest.exists():
+            print(f"  {dest.name}: already present")
+            continue
+        print(f"  downloading {dest.name}...")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(hf_hub_download(repo_id=repo, filename=remote), dest)
+
+
+def run(flux: bool = False) -> None:
     clone_vendor_repos()
     write_extra_model_paths()
     print("Downloading VAE, text encoder, depth and segmentation models...")
     download_small_weights()
     download_dream_models()
+    if flux:
+        print("Downloading FLUX.1 Fill, its text encoders and VAE (~14GB)...")
+        download_flux_models()
     print("\nSetup complete. Run `soto doctor` to verify the environment.")
 
 

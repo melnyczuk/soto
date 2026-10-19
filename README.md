@@ -295,32 +295,46 @@ copy of itself scaled to fill the frame. It renders in seconds.
 
 `--fill dream` uses no model either ([`dream.py`](src/soto/dream.py)). It
 finds the clip's subject (or subjects) and keeps it sharp, and fills the new
-edges with real detail from the clip's own background, quilted together the
-way content-aware fill used to. Working outward from the clip's edges, each
-patch is cut from somewhere in the background whose overlap with what's
-already there (the clip, or the patches before it) matches well, and
-neighbouring patches crossfade into each other. Each frame's patches are cut
-from that frame, so the fill moves with the footage. The footage changes as
+edges with small pieces of the clip's own background, collaged together the
+way content-aware fill used to quilt. Each piece is cut along the outline of
+a background object SAM found in the clip (a rock, a patch of sky, a bush),
+the way [supercollager](https://github.com/melnyczuk/supercollager) cuts its
+pieces, or as a random blob where there's none. They sit apart, on a ground
+of the clip smeared outward from its centre, so the fill is fragments of
+real detail joined by invented soft material. Working outward from the
+clip's edges, each piece is cut from somewhere in the background whose
+overlap with what's already there (the clip, the pieces before it, and a
+little the ground) matches well. Each frame's pieces are cut from that
+frame, so the fill moves with the footage. The footage changes as
 it goes, so each second gets its own choice of patches, matched over a few
 of its frames and never taken from anywhere the subject is during it, and
 crossfades into the next. A patch keeps its source from one second to the
 next while it still fits, so steady footage keeps the same fill throughout.
 
-So it doesn't read as a repeating pattern, the patches sit on a jittered
+So it doesn't read as a repeating pattern, the pieces sit on a jittered
 lattice and any of them can be flipped left to right. A source also gets
 more expensive each time it's used, and one from right beside where the
-patch goes costs more too (it would only repeat what's at the clip's edge).
-Each patch is drawn at random from the good matches, weighted toward the
-best. Patches never come from the subject, except where the fill carries on
+piece goes costs more too (it would only repeat what's at the clip's edge).
+Each piece is drawn at random from the good matches, weighted toward the
+best. Pieces never come from the subject, except where the fill carries on
 from a subject cut off by the clip's edge: there the subject carries on
 too. `--seed` picks the layout.
-`--texture mirror` reflects the clip outward instead.
+`--texture mirror` reflects the clip outward instead. `--texture vace` has
+VACE outpaint the new edges first, exactly as `--fill vace` does, and lays
+the dream look over its picture instead: the subject kept sharp, the blur,
+the bend and the streaks. That's as slow as `--fill vace` (and takes
+`--steps`, `--preview` and `--seed` like it), but the new edges look like
+the same place rather than a collage of it. Unlike `--fill vace-dream`,
+VACE isn't asked to restyle anything: it only continues the scene.
 
 Then everything but the subject is blurred, more the further it is from it,
-lightly in the clip's own background and more toward the output's corners.
-The blur is wider than it is tall, and highlights smear into soft horizontal
-streaks, as through an anamorphic lens. It takes about a minute for 10s at
-1920x1536.
+lightly in the clip's own background, a little more at the clip's edge, and
+building slowly from there toward the output's corners, so there's no jump
+from the real picture to the new edges.
+The blur is two and a half times wider than it is tall, and highlights smear
+into long soft horizontal streaks, as through an anamorphic lens. Where the
+subject runs off the clip's edge, it softens into the fill as itself. It
+takes about a minute for 10s at 1920x1536, plus the planning below.
 
 The subject is found with two small models, both fetched by `soto setup`:
 [Depth Anything V2
@@ -342,13 +356,20 @@ blended from those either side.
 Everything is then blurred by how far it is in depth from the subject, as
 through a lens focused on it, so the ground the subject stands on stays
 sharp while the distance and the near foreground soften. Depth also steers
-the quilt: patches are matched on it as well as colour, so the new picture
+the quilt: pieces are matched on it as well as colour, so the new picture
 below a clip carries on from its nearest ground, not from the hills behind.
-And it bends the new edges, as the edges of an anamorphic lens do:
-stretched a little outward from the centre and swirled a little round it,
-nothing at the clip's edge and most toward the corners, and more the
-further each part is in depth from the subject. `--deform` scales it (0
-turns it off). Finding the subject takes about 10s per second of footage.
+And it bends the picture, as the edges of an anamorphic lens do: stretched
+outward from the centre, much more sideways than up and down, swirled round
+it, and with red and blue drawn apart into colour fringes. The bend comes in
+very softly from an ellipse round the clip's centre, so the middle stays
+put, the clip's own corners start to bend, and it's strongest at the
+output's corners; it's more the further each part is in depth from the
+subject, and never on the subject itself. `--deform` scales it (0 turns it
+off). The bent parts also drift slowly, like heat haze, as much as the
+camera moves: the whole frame's shift is measured as it goes, so a shot on
+a tripod barely ripples and a pan or a handheld shot ripples fully.
+`--wobble` scales that (0 turns it off). Finding the subject takes about 10s per second of
+footage, and planning the pieces about as long again.
 
 `--focus depth` skips the segmentation and takes the subject to be what's
 near the colour-and-motion guess at about its depth. That's quicker, but
@@ -380,6 +401,34 @@ border, with a dreamy prompt. The mask comes in with the blur: none on the
 subject, rising to 0.8 at the clip's edges and beyond, so VACE restyles the
 blur and leaves the subject alone. The result is laid back over the dream
 fill rendered at full size, fading in as the blur does.
+
+`--texture flux` uses an image model made for outpainting instead, [FLUX.1
+Fill [dev]](https://huggingface.co/black-forest-labs/FLUX.1-Fill-dev)
+(non-commercial license; as a Q5 GGUF with its text encoders and VAE, ~14GB,
+fetched by `soto setup --flux`). It outpaints a keyframe every two seconds
+of the clip to the whole canvas, starting from the clip smeared outward
+rather than a blank border. Each keyframe after the first starts from the
+last one's picture and only remakes part of it, so the scene keeps its
+layout as the footage moves on, and the frames between crossfade from one
+to the next. Flux also redraws a wide band just inside the clip's edge, and
+the clip fades into that over the band, so it fades into Flux's own version
+of itself rather than straight into a different picture. And since the
+generated picture is held from one keyframe while the footage's light and
+colour drift, it's matched to each frame broadly, by how the two differ
+along that band, carried on out and fading away from the clip. The dream
+look goes over that, as with `--texture vace`. It
+takes `--prompt` (describing the whole scene helps), `--steps` and `--seed`.
+
+When the new edges are most of the output (a landscape clip in a portrait
+frame), VACE is inventing more than half the picture from a strip of
+footage, and it tends to go strange. `--grow-step` (with `--fill vace`, or
+`--fill dream --texture vace`) has it build out in passes instead: each
+pass fills a ring around what the passes before made, at most that much of
+its own frame new across and down, so it always has most of the picture to
+go on, and the next pass carries on from it. `--grow-step 0.2` takes a
+1080x608 clip out to 1080x1350 in four passes (760, 950, 1188 and 1350
+tall). Each pass is a full VACE run over the clip, so it's that many times
+slower. Between passes the canvases are kept losslessly.
 
 ## Softening the seams
 

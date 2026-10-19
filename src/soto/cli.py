@@ -253,12 +253,15 @@ def _plan_extend_context(gap: int, available: int, want: int) -> int | None:
 
 
 @app.command()
-def setup() -> None:
+def setup(
+    flux: bool = typer.Option(False, "--flux", help="Also fetch FLUX.1 Fill (~14GB, non-commercial license), "
+                              "for `expand --fill dream --texture flux`."),
+) -> None:
     """Vendor ComfyUI + ComfyUI-GGUF and download the model pieces
     (UNet, VAE, text encoder)."""
     from soto import setup as setup_mod
 
-    setup_mod.run()
+    setup_mod.run(flux=flux)
 
 
 @app.command()
@@ -1075,12 +1078,14 @@ def _scale_rect(rect: tuple[int, int, int, int], sx: float, sy: float, w: int, h
 
 
 def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int, overlap: int,
-                    model: str, prompt: str, steps: int, seed: int, log: RunLog, dream=None) -> list:
+                    model: str, prompt: str, steps: int, seed: int, log: RunLog, dream=None,
+                    surround: bool = False) -> list:
     """Outpaints the whole clip at working resolution, `window` frames per
     VACE run, each run after the first given the previous one's last
     `overlap` canvases. Returns one uint8 canvas per frame of the clip.
     `dream`, a (Focus, DreamLook, QuiltTrack or None) triple, starts VACE
-    from the dream fill instead of a blank border."""
+    from the dream fill instead of a blank border; `surround` pads it with
+    the clip smeared outward instead of white, and steers it off borders."""
     import numpy as np
 
     from soto import comfy_engine, video
@@ -1115,7 +1120,8 @@ def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int
             )
         else:
             control_video, control_mask = video.build_outpaint_batch(
-                given, frames, width, height, rect, config.EXPAND_SEAM_PX
+                given, frames, width, height, rect, config.EXPAND_SEAM_PX,
+                surround=dreaming.surround(frames, rect, width, height) if surround else None,
             )
         run_seed = (seed + i) % 2**32
         print(f"[{i + 1}/{n_windows}] Running Wan2.1-VACE ({model}) on frames {start}-{start + n_new - 1}...")
@@ -1129,7 +1135,7 @@ def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int
                 length=length + pad,
                 model=model,
                 prompt=prompt,
-                negative_prompt=config.DEFAULT_NEGATIVE_PROMPT,
+                negative_prompt=(config.EXPAND_BORDER_NEGATIVE if surround else "") + config.DEFAULT_NEGATIVE_PROMPT,
                 steps=steps,
                 seed=run_seed,
             )
@@ -1137,6 +1143,79 @@ def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int
         # Kept as uint8: a long clip's worth of float canvases adds up.
         canvases.extend(np.clip(new * 255.0 + 0.5, 0, 255).astype(np.uint8))
         start += n_new
+    return canvases
+
+
+def _grow_boxes(rect, width: int, height: int, step: float) -> list[tuple[int, int, int, int]]:
+    """The stretches of the output canvas each pass of `--grow-step` fills
+    out to, from `rect` to the whole canvas: each at most `step` new across
+    and down, its new picture split between the sides in proportion to how
+    far each still has to go, so they all reach the canvas's edge together."""
+    def grow(lo: int, hi: int, extent: int) -> tuple[int, int]:
+        size = hi - lo
+        if size >= extent:
+            return lo, hi
+        add = min(extent - size, max(2, round(size / (1.0 - step) - size)))
+        before, after = lo, extent - hi
+        a = min(before, round(add * before / (before + after)))
+        b = min(after, add - a)
+        if a + b < add:
+            a = min(before, add - b)
+        return lo - a, hi + b
+
+    boxes = []
+    x0, y0, x1, y1 = rect
+    while (x0, y0, x1, y1) != (0, 0, width, height):
+        (x0, x1), (y0, y1) = grow(x0, x1, width), grow(y0, y1, height)
+        boxes.append((x0, y0, x1, y1))
+    return boxes
+
+
+def _expand_grown(clip: Path, info, out_w: int, out_h: int, rect, step: float, area: int | None, window: int,
+                  overlap: int, model: str, prompt: str, steps: int, seed: int, log: RunLog,
+                  scratch: Path, keep: Path | None = None, passes: int | None = None) -> list:
+    """Outpaints the clip out to the whole `out_w`x`out_h` canvas a little
+    at a time: each pass VACE fills a ring at most `step` of its frame wide
+    around what the passes before made, so it always has most of its frame
+    to go on. Returns one uint8 canvas per frame, at the output's size.
+    `keep` is a folder to keep each pass's canvases in; `passes` stops after
+    that many (returning nothing), for trying out the first few."""
+    import numpy as np
+
+    from soto import video
+
+    boxes = _grow_boxes(rect, out_w, out_h, step)
+    print(f"Growing out in {len(boxes)} passes: " + " -> ".join(f"{b[2] - b[0]}x{b[3] - b[1]}" for b in boxes))
+    source, inner = clip, rect
+    canvases: list = []
+    for k, box in enumerate(boxes):
+        bx0, by0, bx1, by1 = box
+        bw, bh = bx1 - bx0, by1 - by0
+        # What's made so far, where it sits in this pass's frame.
+        known = (inner[0] - bx0, inner[1] - by0, inner[2] - bx0, inner[3] - by0)
+        width, height = _fit_working_resolution(bw, bh, area)
+        work_rect = _scale_rect(known, width / bw, height / bh, width, height)
+        print(f"Pass {k + 1}/{len(boxes)}: {known[2] - known[0]}x{known[3] - known[1]} -> {bw}x{bh} "
+              f"(working {width}x{height})")
+        with log.run(grow_pass=k + 1, box=list(box), working=[width, height]):
+            generated = _expand_windows(source, video.probe(source), width, height, work_rect, window, overlap,
+                                        model, prompt, steps, (seed + 1000 * k) % 2**32, log, surround=True)
+        frames = video.composite_outpaint(generated, source, known, bw, bh,
+                                          config.EXPAND_SEAM_PX * bw / width)
+        last = k + 1 == len(boxes) or k + 1 == passes
+        if not last or keep is not None:
+            # Lossless, for the next pass to build out from.
+            source = (keep or scratch) / f"grow-{k + 1}.mkv"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            video.write_lossless(frames, info.fps, source)
+            inner = box
+            if k + 1 == passes:
+                print(f"  stopped after {passes} passes; kept in {keep or scratch}")
+                return []
+            if last:
+                frames = (f.astype(np.float32) / 255.0 for f in video.iter_frames(source, bw, bh))
+        if last:
+            canvases = [np.clip(f * 255.0 + 0.5, 0, 255).astype(np.uint8) for f in frames]
     return canvases
 
 
@@ -1188,16 +1267,34 @@ def expand(
     ),
     deform: float = typer.Option(
         config.DREAM_DEFORM, "--deform", min=0.0, max=4.0,
-        help="--fill dream and vace-dream: how much the new edges bend, as at the edges of an anamorphic lens: "
-        "stretched a little outward and swirled a little round the centre, more the further they are in depth "
-        "from the subject (1 = default, 0 = none).",
+        help="--fill dream and vace-dream: how much the picture bends, as at the edges of an anamorphic lens: "
+        "stretched outward (mostly sideways) and swirled round the centre, with red and blue drawn apart. It "
+        "comes in softly from an ellipse round the clip's centre, so the clip's own corners bend a little, "
+        "the subject never does, and more the further each part is in depth from the subject "
+        "(1 = default, 0 = none).",
+    ),
+    wobble: float = typer.Option(
+        config.DREAM_WOBBLE, "--wobble", min=0.0, max=4.0,
+        help="--fill dream and vace-dream: how much the bent edges drift, slowly, like heat haze "
+        "(1 = default, 0 = none). Only where they bend.",
     ),
     texture: str = typer.Option(
         config.DREAM_TEXTURES[0], "--texture",
         help=f"--fill dream and vace-dream: what goes outside the clip before it's blurred, "
         f"{list(config.DREAM_TEXTURES)}. 'quilt' tiles it with patches of the clip's background, matched to "
         "each other and to the clip's edge, as content-aware fill does, cut from each frame so they move with "
-        "the footage (--seed picks the layout). 'mirror' reflects the clip outward.",
+        "the footage (--seed picks the layout). 'mirror' reflects the clip outward. 'vace' (--fill dream only) "
+        "has VACE outpaint the edges as --fill vace does, then lays the dream look over them: slow, but the "
+        "new edges look real. 'flux' (--fill dream only) outpaints a keyframe every couple of seconds with "
+        "FLUX.1 Fill, an image model made for it (`soto setup --flux`), each carrying on from the last, "
+        "crossfades between them, and lays the dream look over that. Takes --prompt, --steps and --seed.",
+    ),
+    grow_step: float = typer.Option(
+        None, "--grow-step", min=0.05, max=0.9,
+        help="--fill vace and --fill dream --texture vace: outpaint in passes instead of all at once, each "
+        "making at most this much of its frame new (across and down), around what the passes before made, so "
+        "VACE always has most of the picture to go on. 0.2 = a fifth. Slower: a full VACE run over the clip "
+        "per pass.",
     ),
     fit: str = typer.Option(
         "contain", "--fit",
@@ -1234,6 +1331,8 @@ def expand(
         raise typer.BadParameter(f"must be one of {list(config.DREAM_FOCUS_MODES)}", param_hint="--focus")
     if texture not in config.DREAM_TEXTURES:
         raise typer.BadParameter(f"must be one of {list(config.DREAM_TEXTURES)}", param_hint="--texture")
+    if texture in ("vace", "flux") and fill != "dream":
+        raise typer.BadParameter(f"'{texture}' only goes with --fill dream", param_hint="--texture")
     if fit not in config.EXPAND_FITS:
         raise typer.BadParameter(f"must be one of {list(config.EXPAND_FITS)}", param_hint="--fit")
     if model not in config.MODELS:
@@ -1269,10 +1368,10 @@ def expand(
               f"from ({rect[0]}, {rect[1]})")
 
         look = dreaming.DreamLook(strength=dream_strength, feather=feather, falloff=focus_falloff, streak=streak,
-                                  depth_falloff=depth_falloff, deform=deform)
+                                  depth_falloff=depth_falloff, deform=deform, wobble=wobble, fps=info.fps)
         look_settings = {"dream_strength": dream_strength, "feather": feather, "focus": focus,
                          **({"depth_falloff": depth_falloff} if focus == "depth" else {"focus_falloff": focus_falloff}),
-                         "streak": streak, "deform": deform, "texture": texture}
+                         "streak": streak, "deform": deform, "wobble": wobble, "texture": texture}
 
         def find_subject():
             print(f"Finding the subject ({focus})...")
@@ -1284,8 +1383,11 @@ def expand(
             print("Quilting the new edges...")
             return dreaming.plan_quilt(clip, info, subject, rect, out_w, out_h, seed)
 
-        if fill in ("blur", "dream"):
-            ignored = [flag for flag, value in (("--steps", steps), ("--preview", preview),
+        # `--fill dream --texture vace` runs VACE first, so it goes the VACE way.
+        generated_base = fill == "dream" and texture == "vace"
+        if fill in ("blur", "dream") and not generated_base:
+            ignored = [flag for flag, value in (("--steps", None if texture == "flux" else steps),
+                                                ("--preview", preview),
                                                 ("--export-generated", export_generated)) if value is not None]
             if fill == "blur" and seed is not None:
                 ignored.append("--seed")
@@ -1294,13 +1396,24 @@ def expand(
             log.settings["seed"] = resolved_seed = None
             if fill == "dream":
                 log.settings.update(look_settings)
-                resolved_seed = _resolve_seed(seed, log) if texture == "quilt" else None
+                resolved_seed = _resolve_seed(seed, log) if texture in ("quilt", "flux") else None
                 with log.run(fill="dream"):
                     subject = find_subject()
-                    quilt = plan_quilt(subject, resolved_seed)
-                    print("Rendering dream fill...")
-                    video.write_outpaint(dreaming.dream_frames(clip, info, subject, rect, out_w, out_h, look, quilt),
-                                         fps, out_w, out_h, clip, output)
+                    if texture == "flux":
+                        flux_steps = steps or config.FLUX_STEPS
+                        log.settings.update({"prompt": prompt, "steps": flux_steps, "flux_model": config.FLUX_FILL_FILENAME,
+                                             "flux_key_seconds": config.FLUX_KEY_SECONDS,
+                                             "flux_redenoise": config.FLUX_REDENOISE})
+                        print("Outpainting keyframes with FLUX.1 Fill...")
+                        plates, seam = dreaming.flux_plates(clip, info, rect, out_w, out_h, prompt, flux_steps,
+                                                            resolved_seed)
+                        print("Rendering dream fill...")
+                        frames = dreaming.over_generated(plates, clip, subject, rect, out_w, out_h, look, seam)
+                    else:
+                        quilt = plan_quilt(subject, resolved_seed)
+                        print("Rendering dream fill...")
+                        frames = dreaming.dream_frames(clip, info, subject, rect, out_w, out_h, look, quilt)
+                    video.write_outpaint(frames, fps, out_w, out_h, clip, output)
             else:
                 print("Rendering blur fill...")
                 with log.run(fill="blur"):
@@ -1327,6 +1440,8 @@ def expand(
             "overlap": overlap,
             "seam_px": config.EXPAND_SEAM_PX,
             **({**look_settings, "dream_mask": config.EXPAND_DREAM_MASK} if dream else {}),
+            **(look_settings if generated_base else {}),
+            **({"grow_step": grow_step} if grow_step else {}),
         })
         resolved_seed = _resolve_seed(seed, log)
         log.settings["seed_note"] = "window i (from 0) uses seed + i"
@@ -1335,15 +1450,28 @@ def expand(
         print(f"seed={resolved_seed}, steps={steps}")
 
         subject = quilt = None
-        if dream:
+        if dream or generated_base:
             subject = find_subject()
+        if dream:
             quilt = plan_quilt(subject, resolved_seed)
-        canvases = _expand_windows(clip, info, width, height, work_rect, window, overlap, model, prompt, steps,
-                                   resolved_seed, log, dream=(subject, look, quilt) if dream else None)
+        if grow_step and not dream:
+            canvases = _expand_grown(clip, info, out_w, out_h, rect, grow_step, area, window, overlap, model,
+                                     prompt, steps, resolved_seed, log, conform_dir)
+            # Already at the output's size, the clip laid back in each pass.
+            width, height = out_w, out_h
+        else:
+            if grow_step:
+                print("  note: --grow-step doesn't apply to --fill vace-dream; ignored")
+            canvases = _expand_windows(clip, info, width, height, work_rect, window, overlap, model, prompt,
+                                       steps, resolved_seed, log, dream=(subject, look, quilt) if dream else None,
+                                       surround=generated_base)
 
         print("Compositing final output...")
         if dream:
             frames = dreaming.composite(canvases, clip, subject, rect, out_w, out_h, look, quilt)
+        elif generated_base:
+            frames = dreaming.over_generated(canvases, clip, subject, rect, out_w, out_h, look,
+                                             config.EXPAND_SEAM_PX * out_w / width)
         else:
             frames = video.composite_outpaint(canvases, clip, rect, out_w, out_h,
                                               config.EXPAND_SEAM_PX * out_w / width)

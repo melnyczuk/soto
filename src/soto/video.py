@@ -425,17 +425,20 @@ def _inner_rect(rect: Rect, width: int, height: int, seam: float) -> tuple[float
 
 
 def build_outpaint_batch(
-    given: np.ndarray, frames: np.ndarray, width: int, height: int, rect: Rect, seam_px: int
+    given: np.ndarray, frames: np.ndarray, width: int, height: int, rect: Rect, seam_px: int,
+    surround: np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Builds the (control_video, control_mask) pair for outpainting:
-    `frames` (already scaled to `rect`'s size) placed on a white canvas,
+    `frames` (already scaled to `rect`'s size) placed on a white canvas (or
+    on `surround`, (n, height, width, 3), if given),
     masked (1 = generate) everywhere outside `rect` and `seam_px` into it,
     so VACE redraws a band across the seam for the composite to blend over.
     `given` are whole canvases from the previous window, kept as they are
     (mask 0) so the new borders carry on from the old ones."""
     x0, y0, x1, y1 = rect
     n_given = given.shape[0]
-    placed = np.ones((frames.shape[0], height, width, 3), dtype=np.float32)
+    placed = (np.ones((frames.shape[0], height, width, 3), dtype=np.float32) if surround is None
+              else surround.astype(np.float32, copy=True))
     placed[:, y0:y1, x0:x1] = frames
     video = np.concatenate([given, placed], axis=0)
 

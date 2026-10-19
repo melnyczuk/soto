@@ -98,6 +98,34 @@ DEPTH_MODEL_DIR = MODELS_DIR / "depth" / "Depth-Anything-V2-Small-hf"
 SEGMENT_MODEL_REPO = "nielsr/slimsam-50-uniform"
 SEGMENT_MODEL_DIR = MODELS_DIR / "segment" / "slimsam-50-uniform"
 
+# FLUX.1 Fill [dev], an image model made for in- and outpainting, for
+# `expand --fill dream --texture flux` (FLUX.1 [dev] Non-Commercial License;
+# ~14GB in all, fetched by `soto setup --flux`): the model as GGUF, its two
+# text encoders (T5 as GGUF too) and its VAE (Comfy-Org's copy, ungated).
+FLUX_FILL_REPO = "YarvixPA/FLUX.1-Fill-dev-GGUF"
+FLUX_FILL_FILENAME = "flux1-fill-dev-Q5_K_S.gguf"
+FLUX_T5_REPO = "city96/t5-v1_1-xxl-encoder-gguf"
+FLUX_T5_FILENAME = "t5-v1_1-xxl-encoder-Q8_0.gguf"
+FLUX_CLIP_REPO = "comfyanonymous/flux_text_encoders"
+FLUX_CLIP_FILENAME = "clip_l.safetensors"
+FLUX_VAE_REPO = "Comfy-Org/Lumina_Image_2.0_Repackaged"
+FLUX_VAE_REMOTE_PATH = "split_files/vae/ae.safetensors"
+FLUX_VAE_FILENAME = "flux_ae.safetensors"
+# How it's run: working area (at the output's aspect), steps, guidance (Fill
+# wants it high), sampler; a keyframe every this many seconds, each after the
+# first started from the last one's fill and remade this much of the way, so
+# the scene keeps its layout; and how far into the clip it may redraw, at
+# working size, to blend its edge: wide, so the clip fades into Flux's own
+# redraw of it over a long way rather than into a different picture.
+FLUX_AREA = 1024 * 1024
+FLUX_STEPS = 24
+FLUX_GUIDANCE = 30.0
+FLUX_SAMPLER = "euler"
+FLUX_SCHEDULER = "normal"
+FLUX_KEY_SECONDS = 2.0
+FLUX_REDENOISE = 0.6
+FLUX_SEAM_PX = 96
+
 # `soto train` defaults. pix2pixHD's own: Adam at 2e-4 with beta1 0.5, held
 # for the first half of training and decayed linearly to 0 over the second,
 # and feature-matching and VGG losses weighted 10 each against the GAN loss.
@@ -184,27 +212,29 @@ EXPAND_FILLS = ("vace", "blur", "dream", "vace-dream")
 # blur (with `--focus heuristic`), both as fractions of the output's short
 # side; highlight-streak opacity; with depth, how far in depth from the
 # subject the background takes to blur (as a fraction of the frame's depth
-# range); and how the subject's found.
+# range); how the subject's found; and how much the new edges bend and drift.
 DREAM_STRENGTH = 1.0
-DREAM_FEATHER = 0.25
+DREAM_FEATHER = 0.35
 DREAM_FALLOFF = 0.3
 DREAM_DEPTH_FALLOFF = 0.3
 DREAM_FOCUS_MODES = ("segment", "depth", "heuristic")
-DREAM_STREAK = 0.6
+DREAM_STREAK = 0.8
 DREAM_DEFORM = 1.0
+DREAM_WOBBLE = 1.0
 # How far in from the clip's edges the subject itself starts to blur, as a
 # fraction of the output's short side: it's otherwise kept sharp.
-DREAM_SUBJECT_EDGE = 0.12
+DREAM_SUBJECT_EDGE = 0.2
 # Blur levels (see dream.py; 1 = 5% of a 16:9 clip's width, x --dream-strength):
 # the clip's own background away from the subject, the clip's edges, and the
 # far corners of the output. Then how much wider than tall the blur is.
 DREAM_BACKGROUND = 0.25
-DREAM_EDGE = 0.4
-DREAM_FAR = 0.6
-DREAM_ANAMORPHIC = 1.5
+DREAM_EDGE = 0.25
+DREAM_FAR = 0.9
+DREAM_ANAMORPHIC = 2.5
 # What `--fill dream` and `vace-dream` put outside the clip before blurring:
-# patches of its background quilted together, or the clip mirrored outward.
-DREAM_TEXTURES = ("quilt", "mirror")
+# pieces of its background collaged together, the clip mirrored outward, or
+# (`--fill dream` only) VACE's plain outpainting or FLUX.1 Fill's.
+DREAM_TEXTURES = ("quilt", "mirror", "vace", "flux")
 EXPAND_FITS = ("contain", "native")
 # `--fill vace-dream`: VACE starts from the dream fill rather than a white
 # border, masked up to EXPAND_DREAM_MASK (<1) as the blur comes in, so the
@@ -214,6 +244,10 @@ DEFAULT_DREAM_PROMPT = (
     "dreamy out-of-focus edges of the frame as shot through an anamorphic lens, soft horizontal light "
     "streaks, glowing bokeh, heavily blurred, smooth gradients, soft diffusion"
 )
+# With `--texture vace` and `--grow-step`, VACE's frame is padded with the
+# clip smeared outward, not white (a photo on white reads to it as a framed
+# picture, and it draws the frame), and steered off borders as well.
+EXPAND_BORDER_NEGATIVE = "黑边，边框，信箱模式，白边，相框，black bars, letterbox, border, frame, white edges, "
 DEFAULT_EXPAND_PROMPT = (
     "the scene continuing naturally beyond the edges of the frame, consistent lighting and perspective, "
     "coherent scene, smooth continuous motion, high quality"

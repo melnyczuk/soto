@@ -97,6 +97,10 @@ def _bootstrap() -> None:
         "WanVaceToVideo",
         "KSampler",
         "VAEDecode",
+        "DualCLIPLoaderGGUF",
+        "InpaintModelConditioning",
+        "DifferentialDiffusion",
+        "FluxGuidance",
     ):
         if name not in nodes.NODE_CLASS_MAPPINGS:
             raise RuntimeError(
@@ -327,3 +331,43 @@ def run_vace_transition(
 
     stage("done", "green")
     return TransitionResult(frames=images)
+
+
+class FluxFill:
+    """FLUX.1 Fill, loaded once, for filling in several images in turn
+    (`expand --fill dream --texture flux`): the prompt is encoded once and
+    the text encoders let go, the model and VAE kept."""
+
+    def __init__(self, prompt: str, steps: int):
+        self.steps = steps
+        _bootstrap()
+        with torch.inference_mode():
+            typer.echo("  loading FLUX.1 Fill")
+            (model,) = _call(_node_classes["UnetLoaderGGUF"], unet_name=config.FLUX_FILL_FILENAME)
+            # Lets a soft mask fade the fill in, rather than cutting at 0.5.
+            (self.model,) = _call(_node_classes["DifferentialDiffusion"], model=model)
+            (clip,) = _call(_node_classes["DualCLIPLoaderGGUF"], clip_name1=config.FLUX_T5_FILENAME,
+                            clip_name2=config.FLUX_CLIP_FILENAME, type="flux")
+            (positive,) = _call(_node_classes["CLIPTextEncode"], clip=clip, text=prompt)
+            (self.negative,) = _call(_node_classes["CLIPTextEncode"], clip=clip, text="")
+            (self.positive,) = _call(_node_classes["FluxGuidance"], conditioning=positive,
+                                     guidance=config.FLUX_GUIDANCE)
+            del clip
+            import comfy.model_management
+
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache(force=True)
+            (self.vae,) = _call(_node_classes["VAELoader"], vae_name=config.FLUX_VAE_FILENAME)
+
+    def fill(self, pixels: torch.Tensor, mask: torch.Tensor, seed: int, denoise: float = 1.0) -> torch.Tensor:
+        """(h, w, 3) `pixels` (0-1) with what's under `mask` (h, w, 1 = make
+        new, soft) made anew, `denoise` of the way from what's there."""
+        with torch.inference_mode():
+            positive, negative, latent = _call(_node_classes["InpaintModelConditioning"], positive=self.positive,
+                                               negative=self.negative, vae=self.vae, pixels=pixels[None],
+                                               mask=mask[None], noise_mask=True)
+            (samples,) = _call(_node_classes["KSampler"], model=self.model, seed=seed, steps=self.steps,
+                               cfg=1.0, sampler_name=config.FLUX_SAMPLER, scheduler=config.FLUX_SCHEDULER,
+                               positive=positive, negative=negative, latent_image=latent, denoise=denoise)
+            (images,) = _call(_node_classes["VAEDecode"], vae=self.vae, samples=samples)
+        return images[0].float().cpu()
