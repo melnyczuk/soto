@@ -89,8 +89,8 @@ VAE_DTYPES = ("bf16", "fp16", "fp32")
 # or copied in by hand from the older soto-pix2pixHD project (its
 # checkpoints/<name>/latest_net_G.pth).
 PIX2PIXHD_DIR = MODELS_DIR / "pix2pixhd"
-# Depth Anything V2 Small, for finding the subject in `expand --fill dream`
-# and `vace-dream` (Apache-2.0; ~95MB, fetched by `soto setup`).
+# Depth Anything V2 Small, for finding the subject in `expand`
+# (Apache-2.0; ~95MB, fetched by `soto setup`).
 DEPTH_MODEL_REPO = "depth-anything/Depth-Anything-V2-Small-hf"
 DEPTH_MODEL_DIR = MODELS_DIR / "depth" / "Depth-Anything-V2-Small-hf"
 # SlimSAM (Segment Anything, pruned), for cutting the subject out whole
@@ -99,7 +99,7 @@ SEGMENT_MODEL_REPO = "nielsr/slimsam-50-uniform"
 SEGMENT_MODEL_DIR = MODELS_DIR / "segment" / "slimsam-50-uniform"
 
 # FLUX.1 Fill [dev], an image model made for in- and outpainting, for
-# `expand --fill dream --texture flux` (FLUX.1 [dev] Non-Commercial License;
+# `soto expand` (FLUX.1 [dev] Non-Commercial License;
 # ~14GB in all, fetched by `soto setup --flux`): the model as GGUF, its two
 # text encoders (T5 as GGUF too) and its VAE (Comfy-Org's copy, ungated).
 FLUX_FILL_REPO = "YarvixPA/FLUX.1-Fill-dev-GGUF"
@@ -206,54 +206,44 @@ VACE_LENGTH_STRIDE = 4
 # being VACE's native clip length; every run after the first is given the
 # previous run's last EXPAND_OVERLAP generated frames, whole, so the new
 # borders carry on from the old ones instead of being reinvented each window.
-# EXPAND_SEAM_PX (at working resolution) is how far the generated area
-# reaches into the real footage, for the composite to feather across.
 EXPAND_WINDOW = 81
 EXPAND_OVERLAP = 8
-EXPAND_SEAM_PX = 16
-EXPAND_FILLS = ("vace", "blur", "dream", "vace-dream")
-# `--fill dream` and `vace-dream` defaults (see dream.py): blur strength
+# The anamorphic look's defaults (see anamorphic.py): blur strength
 # multiplier; how far in from the clip's edges the blur reaches full
 # strength, and how far from the subject the clip's background takes to
 # blur (with `--focus heuristic`), both as fractions of the output's short
 # side; highlight-streak opacity; with depth, how far in depth from the
 # subject the background takes to blur (as a fraction of the frame's depth
 # range); how the subject's found; and how much the new edges bend and drift.
-DREAM_STRENGTH = 1.0
-DREAM_FEATHER = 0.35
-DREAM_FALLOFF = 0.3
-DREAM_DEPTH_FALLOFF = 0.3
-DREAM_FOCUS_MODES = ("segment", "depth", "heuristic")
-DREAM_STREAK = 0.8
-DREAM_DEFORM = 1.0
-DREAM_WOBBLE = 1.0
+ANAMORPHIC_STRENGTH = 1.0
+ANAMORPHIC_FEATHER = 0.35
+ANAMORPHIC_FALLOFF = 0.3
+ANAMORPHIC_DEPTH_FALLOFF = 0.3
+ANAMORPHIC_FOCUS_MODES = ("segment", "depth", "heuristic")
+ANAMORPHIC_STREAK = 0.8
+ANAMORPHIC_DEFORM = 1.0
+# Drift is scaled by how much the camera moves: none for a held shot.
+ANAMORPHIC_WOBBLE = 0.5
 # How far in from the clip's edges the subject itself starts to blur, as a
 # fraction of the output's short side: it's otherwise kept sharp.
-DREAM_SUBJECT_EDGE = 0.2
-# Blur levels (see dream.py; 1 = 5% of a 16:9 clip's width, x --dream-strength):
+ANAMORPHIC_SUBJECT_EDGE = 0.2
+# Blur levels (see anamorphic.py; 1 = 5% of a 16:9 clip's width, x --anamorphic-strength):
 # the clip's own background away from the subject, the clip's edges, and the
 # far corners of the output. Then how much wider than tall the blur is.
-DREAM_BACKGROUND = 0.25
-DREAM_EDGE = 0.25
-DREAM_FAR = 0.9
-DREAM_ANAMORPHIC = 2.5
-# What `--fill dream` and `vace-dream` put outside the clip before blurring:
-# pieces of its background collaged together, the clip mirrored outward, or
-# (`--fill dream` only) VACE's plain outpainting or FLUX.1 Fill's.
-DREAM_TEXTURES = ("quilt", "mirror", "vace", "flux")
+ANAMORPHIC_BACKGROUND = 0.25
+ANAMORPHIC_EDGE = 0.25
+ANAMORPHIC_FAR = 0.9
+ANAMORPHIC_SQUEEZE = 2.5
 EXPAND_FITS = ("contain", "native")
-# `--fill vace-dream`: VACE starts from the dream fill rather than a white
-# border, masked up to EXPAND_DREAM_MASK (<1) as the blur comes in, so the
-# fill shows through for VACE to restyle and the subject is left alone.
-EXPAND_DREAM_MASK = 0.8
-DEFAULT_DREAM_PROMPT = (
+# VACE starts from the anamorphic look over Flux's outpainting, masked up to
+# EXPAND_ANAMORPHIC_MASK (<1) as the blur comes in, so the picture shows through
+# for VACE to restyle and the subject is left alone.
+EXPAND_ANAMORPHIC_MASK = 0.8
+DEFAULT_ANAMORPHIC_PROMPT = (
     "dreamy out-of-focus edges of the frame as shot through an anamorphic lens, soft horizontal light "
     "streaks, glowing bokeh, heavily blurred, smooth gradients, soft diffusion"
 )
-# With `--texture vace` and `--grow-step`, VACE's frame is padded with the
-# clip smeared outward, not white (a photo on white reads to it as a framed
-# picture, and it draws the frame), and steered off borders as well.
-EXPAND_BORDER_NEGATIVE = "黑边，边框，信箱模式，白边，相框，black bars, letterbox, border, frame, white edges, "
+# What Flux is asked to paint outside the clip; describing the whole scene helps.
 DEFAULT_EXPAND_PROMPT = (
     "the scene continuing naturally beyond the edges of the frame, consistent lighting and perspective, "
     "coherent scene, smooth continuous motion, high quality"

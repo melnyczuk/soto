@@ -394,7 +394,7 @@ def run_vace_transition(
 
 class FluxFill:
     """FLUX.1 Fill, loaded once, for filling in several images in turn
-    (`expand --fill dream --texture flux`): the prompt is encoded once and
+    (`soto expand`): the prompt is encoded once and
     the text encoders let go, the model and VAE kept."""
 
     def __init__(self, prompt: str, steps: int):

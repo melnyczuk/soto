@@ -87,8 +87,8 @@ def download_small_weights() -> None:
         print(f"  {config.TEXT_ENCODER_FILENAME}: already present")
 
 
-def download_dream_models() -> None:
-    """The depth and segmentation models `expand --fill dream` finds the subject with."""
+def download_subject_models() -> None:
+    """The depth and segmentation models `expand` finds the subject with."""
     from huggingface_hub import snapshot_download
 
     for repo, path in ((config.DEPTH_MODEL_REPO, config.DEPTH_MODEL_DIR),
@@ -101,8 +101,7 @@ def download_dream_models() -> None:
 
 
 def download_flux_models() -> None:
-    """FLUX.1 Fill and its text encoders and VAE, for `expand --fill dream
-    --texture flux`."""
+    """FLUX.1 Fill and its text encoders and VAE, for `expand`."""
     from huggingface_hub import hf_hub_download
 
     for repo, remote, dest in (
@@ -124,7 +123,7 @@ def run(flux: bool = False) -> None:
     write_extra_model_paths()
     print("Downloading VAE, text encoder, depth and segmentation models...")
     download_small_weights()
-    download_dream_models()
+    download_subject_models()
     if flux:
         print("Downloading FLUX.1 Fill, its text encoders and VAE (~14GB)...")
         download_flux_models()
