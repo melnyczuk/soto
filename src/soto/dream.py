@@ -1194,15 +1194,16 @@ def dream_frames(clip: Path, info: video.ClipInfo, focus: Focus, rect: Rect, wid
 
 
 def composite(canvases: list[np.ndarray], clip: Path, focus: Focus, rect: Rect, width: int, height: int,
-              look: DreamLook, quilt: QuiltTrack | None, chunk: int = 8) -> Iterable[np.ndarray]:
+              look: DreamLook, quilt: QuiltTrack | None, chunk: int = 8, first: int = 0) -> Iterable[np.ndarray]:
     """`--fill vace-dream`'s output frames: VACE's canvases (uint8, any
     resolution) scaled up, with the dream fill of the clip at full quality
     laid over them, fading out as the blur comes in, where VACE was asked to
-    restyle it."""
+    restyle it. `canvases` are of the clip's frames from `first` on."""
     x0, y0, x1, y1 = rect
-    frames = video.iter_frames(clip, x1 - x0, y1 - y0, flags="lanczos")
-    for start in range(0, len(canvases), chunk):
-        batch = np.stack(canvases[start:start + chunk]).astype(np.float32) / 255.0
+    frames = itertools.islice(video.iter_frames(clip, x1 - x0, y1 - y0, flags="lanczos"), first, None)
+    for offset in range(0, len(canvases), chunk):
+        start = first + offset
+        batch = np.stack(canvases[offset:offset + chunk]).astype(np.float32) / 255.0
         up = video._scale_frames(batch, width, height)
         real = np.stack([f for _, f in zip(range(batch.shape[0]), frames)]).astype(np.float32) / 255.0
         window = focus[start:start + batch.shape[0]]
@@ -1212,19 +1213,20 @@ def composite(canvases: list[np.ndarray], clip: Path, focus: Focus, rect: Rect, 
 
 
 def over_generated(canvases: list[np.ndarray], clip: Path, focus: Focus, rect: Rect, width: int, height: int,
-                   look: DreamLook, seam: float, chunk: int = 8) -> Iterable[np.ndarray]:
+                   look: DreamLook, seam: float, chunk: int = 8, first: int = 0) -> Iterable[np.ndarray]:
     """`--fill dream --texture vace`'s output frames: VACE's plain outpainted
     canvases (uint8, any resolution) scaled up, the clip laid back over them
     across `seam` px, and the dream look over the lot: the subject kept
     sharp, everything else blurred more the further it is from it, bent,
-    fringed and streaked."""
+    fringed and streaked. `canvases` are of the clip's frames from `first` on."""
     from tqdm import tqdm
 
     x0, y0, x1, y1 = rect
-    frames = video.iter_frames(clip, x1 - x0, y1 - y0, flags="lanczos")
+    frames = itertools.islice(video.iter_frames(clip, x1 - x0, y1 - y0, flags="lanczos"), first, None)
     with tqdm(total=len(canvases), unit="frame") as bar:
-        for start in range(0, len(canvases), chunk):
-            batch = np.stack(canvases[start:start + chunk]).astype(np.float32) / 255.0
+        for offset in range(0, len(canvases), chunk):
+            start = first + offset
+            batch = np.stack(canvases[offset:offset + chunk]).astype(np.float32) / 255.0
             up = video._scale_frames(batch, width, height)
             real = np.stack([f for _, f in zip(range(batch.shape[0]), frames)]).astype(np.float32) / 255.0
             window = focus[start:start + batch.shape[0]]
@@ -1259,15 +1261,20 @@ class PlateTrack:
 
 
 def flux_plates(clip: Path, info: video.ClipInfo, rect: Rect, width: int, height: int, prompt: str, steps: int,
-                seed: int) -> tuple[PlateTrack, float]:
+                seed: int, until: int | None = None) -> tuple[PlateTrack, float]:
     """Outpaints a keyframe every `config.FLUX_KEY_SECONDS` of the clip to
     the whole `width`x`height` canvas with FLUX.1 Fill, at a working size
     near `config.FLUX_AREA`. The first is made from scratch, on the clip
     smeared outward (see `surround`); each after it starts from the last
     one's fill and only remakes `config.FLUX_REDENOISE` of it, so the scene
-    keeps its layout as the footage moves on. Returns the plates and the
-    seam to lay the clip back over them with, at the output's size."""
-    from soto import comfy_engine
+    keeps its layout as the footage moves on. With `until`, stops at the
+    first keyframe at or past that frame. Returns the plates and the seam to
+    lay the clip back over them with, at the output's size.
+
+    Each plate is kept in the work dir as a PNG (see `workdir`), so a later
+    run carries on from them, and one edited by hand is used as edited, the
+    keyframes after it made again from it."""
+    from soto import comfy_engine, workdir
 
     x0, y0, x1, y1 = rect
     aspect = width / height
@@ -1278,12 +1285,14 @@ def flux_plates(clip: Path, info: video.ClipInfo, rect: Rect, width: int, height
     rw, rh = wr[2] - wr[0], wr[3] - wr[1]
     every = max(1, round(info.fps * config.FLUX_KEY_SECONDS))
     keys = sorted({*range(0, info.n_frames, every), info.n_frames - 1})
+    if until is not None:
+        keys = keys[:next((n for n, k in enumerate(keys) if k >= until), len(keys) - 1) + 1]
     # New everywhere outside the clip, and a little way into it, softly.
     mask = np.ones((fh, fw), dtype=np.float32)
     mask[wr[1]:wr[3], wr[0]:wr[2]] = 1.0 - _edge_alpha(wr, fw, fh, config.FLUX_SEAM_PX)
 
     print(f"  {len(keys)} keyframes at {fw}x{fh}, {steps} steps each")
-    flux = comfy_engine.FluxFill(prompt, steps)
+    flux = None
     plates: list[np.ndarray] = []
     wanted = set(keys)
     for n, (i, frame) in enumerate((i, f) for i, f in enumerate(video.iter_frames(clip, rw, rh, flags="area"))
@@ -1295,10 +1304,25 @@ def flux_plates(clip: Path, info: video.ClipInfo, rect: Rect, width: int, height
             around = surround(real[None], wr, fw, fh)[0]
         pixels = around.copy()
         pixels[wr[1]:wr[3], wr[0]:wr[2]] = real
-        print(f"  keyframe {n + 1}/{len(keys)} (frame {i})")
-        out = flux.fill(torch.from_numpy(pixels), torch.from_numpy(mask), (seed + n) % 2**32,
-                        1.0 if not plates else config.FLUX_REDENOISE).numpy()
-        # Inside, its redrawn seam is kept: that's what the clip fades into.
-        out = out[:fh, :fw]
-        plates.append(np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8))
+        denoise = 1.0 if not plates else config.FLUX_REDENOISE
+        k = workdir.key(kind="flux", model=config.FLUX_FILL_FILENAME, guidance=config.FLUX_GUIDANCE,
+                        sampler=config.FLUX_SAMPLER, scheduler=config.FLUX_SCHEDULER, prompt=prompt, steps=steps,
+                        pixels=pixels, mask=mask, seed=(seed + n) % 2**32, denoise=denoise)
+        label = f"key-{n:03d}-frame{i:06d}"
+
+        def make():
+            nonlocal flux
+            if flux is None:
+                flux = comfy_engine.FluxFill(prompt, steps)
+            print(f"  keyframe {n + 1}/{len(keys)} (frame {i})")
+            out = flux.fill(torch.from_numpy(pixels), torch.from_numpy(mask), (seed + n) % 2**32, denoise,
+                            on_step=workdir.step_preview(label))
+            # Inside, its redrawn seam is kept: that's what the clip fades into.
+            return out.numpy()[:fh, :fw]
+
+        plate, kept = workdir.cached_image(k, label, make)
+        if kept:
+            print(f"  [cached] keyframe {n + 1}/{len(keys)} (frame {i})")
+        workdir.show(label, [plate])
+        plates.append(plate)
     return PlateTrack(plates, keys, info.n_frames), config.FLUX_SEAM_PX / s

@@ -14,9 +14,11 @@ import asyncio
 import functools
 import sys
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+import numpy
 import torch
 import typer
 from tqdm import tqdm
@@ -204,6 +206,62 @@ def _block_progress(diffusion_model: torch.nn.Module):
         close()
 
 
+# on_step(step, total_steps, rgb): rgb is the sampler's current guess at the
+# finished latent, mapped to (t, h, w, 3) uint8 at latent size.
+StepCallback = Callable[[int, int, numpy.ndarray], None]
+
+
+def _latent_rgb(latent_format, x0: torch.Tensor):
+    """A rough picture of latent `x0` without the VAE: the latent format's
+    own linear map from latent channels to RGB, as ComfyUI's Latent2RGB
+    preview does, but for every latent frame, not just the first."""
+    factors = torch.tensor(latent_format.latent_rgb_factors, dtype=torch.float32)
+    bias = getattr(latent_format, "latent_rgb_factors_bias", None)
+    x = x0[0].detach().float().cpu()  # (c, t, h, w) or (c, h, w)
+    if x.ndim == 3:
+        x = x[:, None]
+    rgb = torch.einsum("cthw,cr->thwr", x, factors)
+    if bias is not None:
+        rgb = rgb + torch.tensor(bias, dtype=torch.float32)
+    return ((rgb + 1.0) / 2.0).clamp(0, 1).mul(255).round().to(torch.uint8).numpy()
+
+
+@contextmanager
+def _step_previews(on_step: StepCallback | None):
+    """Calls `on_step` after every sampling step, with what the model
+    currently thinks the result will be. KSampler builds its step callback
+    with `latent_preview.prepare_callback`, so that's wrapped while it runs."""
+    if on_step is None:
+        yield
+        return
+    import latent_preview
+
+    original = latent_preview.prepare_callback
+    warned = False
+
+    def prepare(model, steps, x0_output_dict=None):
+        inner = original(model, steps, x0_output_dict)
+        latent_format = model.model.latent_format
+
+        def callback(step, x0, x, total_steps):
+            nonlocal warned
+            inner(step, x0, x, total_steps)
+            try:
+                on_step(step + 1, total_steps, _latent_rgb(latent_format, x0))
+            except Exception as e:  # a preview must never stop the run
+                if not warned:
+                    warned = True
+                    typer.echo(f"  warning: no step previews: {e}")
+
+        return callback
+
+    latent_preview.prepare_callback = prepare
+    try:
+        yield
+    finally:
+        latent_preview.prepare_callback = original
+
+
 @dataclass
 class TransitionResult:
     frames: torch.Tensor  # (length, H, W, 3) float32 in [0, 1] -- full VAE-decoded sequence
@@ -221,6 +279,7 @@ def run_vace_transition(
     negative_prompt: str,
     steps: int,
     seed: int,
+    on_step: StepCallback | None = None,
 ) -> TransitionResult:
     # Stage lines are stamped with the time since the start, in front rather
     # than after, so ComfyUI's own warnings landing mid-stage can't split them.
@@ -301,7 +360,7 @@ def run_vace_transition(
             )
 
         stage(f"sampling ({steps} steps)", "magenta")
-        with _block_progress(loaded_model.model.diffusion_model):
+        with _block_progress(loaded_model.model.diffusion_model), _step_previews(on_step):
             (samples,) = _call(
                 _node_classes["KSampler"],
                 model=loaded_model,
@@ -359,10 +418,11 @@ class FluxFill:
             comfy.model_management.soft_empty_cache(force=True)
             (self.vae,) = _call(_node_classes["VAELoader"], vae_name=config.FLUX_VAE_FILENAME)
 
-    def fill(self, pixels: torch.Tensor, mask: torch.Tensor, seed: int, denoise: float = 1.0) -> torch.Tensor:
+    def fill(self, pixels: torch.Tensor, mask: torch.Tensor, seed: int, denoise: float = 1.0,
+             on_step: StepCallback | None = None) -> torch.Tensor:
         """(h, w, 3) `pixels` (0-1) with what's under `mask` (h, w, 1 = make
         new, soft) made anew, `denoise` of the way from what's there."""
-        with torch.inference_mode():
+        with torch.inference_mode(), _step_previews(on_step):
             positive, negative, latent = _call(_node_classes["InpaintModelConditioning"], positive=self.positive,
                                                negative=self.negative, vae=self.vae, pixels=pixels[None],
                                                mask=mask[None], noise_mask=True)

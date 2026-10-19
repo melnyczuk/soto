@@ -93,6 +93,14 @@ def iter_frames(path: Path, width: int, height: int, flags: str = "area") -> Ite
         proc.wait()
 
 
+def frame_size(path: Path) -> tuple[int, int]:
+    """(width, height) of `path`'s video, without counting its frames as `probe` does."""
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+           "-of", "json", str(path)]
+    stream = json.loads(subprocess.run(cmd, capture_output=True, text=True, check=True).stdout)["streams"][0]
+    return int(stream["width"]), int(stream["height"])
+
+
 def write_preview(frames: Iterable[np.ndarray], fps: float, output_path: Path) -> int:
     """Writes (H, W, 3) float32 frames in [0, 1] as a small H.264 mp4, unscaled."""
     return _pipe_frames(frames, fps, output_path, ["-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p"])
@@ -167,7 +175,7 @@ def _pipe_frames(frames: Iterable[np.ndarray], fps: float, output_path: Path, ou
     assert proc.stdin is not None
     n = 0
     for frame in itertools.chain([first], frames):
-        frame_u8 = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
+        frame_u8 = frame if frame.dtype == np.uint8 else np.clip(frame * 255.0, 0, 255).astype(np.uint8)
         proc.stdin.write(frame_u8.tobytes())
         n += 1
     proc.stdin.close()
@@ -484,19 +492,19 @@ def _seam_alpha(rect: Rect, width: int, height: int, seam: float) -> np.ndarray:
 
 def composite_outpaint(
     canvases: list[np.ndarray], clip: Path, rect: Rect, width: int, height: int, seam: float,
-    chunk: int = 32,
+    chunk: int = 32, first: int = 0,
 ) -> Iterable[np.ndarray]:
     """Yields output frames at `width`x`height`: each generated canvas (uint8,
-    any resolution) scaled up, with the clip's own frame, read straight from
-    the source at `rect`'s size, laid over `rect` and feathered into the
-    generated picture across `seam` px."""
+    any resolution) scaled up, with the clip's own frame (from frame
+    `first` on), read straight from the source at `rect`'s size, laid over
+    `rect` and feathered into the generated picture across `seam` px."""
     x0, y0, x1, y1 = rect
     rw, rh = x1 - x0, y1 - y0
     alpha = _seam_alpha(rect, width, height, seam)
     for start in range(0, len(canvases), chunk):
         batch = np.stack(canvases[start:start + chunk]).astype(np.float32) / 255.0
         up = _scale_frames(batch, width, height)
-        real = _read_frames(clip, start, batch.shape[0], rw, rh, flags="lanczos")
+        real = _read_frames(clip, first + start, batch.shape[0], rw, rh, flags="lanczos")
         up[:, y0:y1, x0:x1] = alpha * real + (1.0 - alpha) * up[:, y0:y1, x0:x1]
         yield from up
 

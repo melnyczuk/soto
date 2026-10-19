@@ -99,6 +99,80 @@ Passing `--steps` explicitly overrides the preview's step count. The tiers
 live in `config.PREVIEW_TIERS`. `crossfade` still scales a preview back to
 the clip's native size.
 
+For a look as you go, rather than at the end, see
+[Looking before a long run](#looking-before-a-long-run).
+
+## Looking before a long run
+
+Every VACE and FLUX run keeps a work dir next to its output (`gen.mkv` gets
+`gen.work/`). That's `transition`, `bridge`, `extend` and `expand`. The
+work dir gives you three ways to see where a run is going before you commit
+hours to it.
+
+**Progress PNGs.** While it runs, `progress/step.png` shows the model's
+current guess at the picture after every sampling step. It's a rough
+picture made straight from the latents, without the VAE, so it costs
+nothing. Every step's guess is also kept as `<run>-step-NN.png`, so you can
+see roughly when the picture settles. That's not quite what a run with
+that many steps would give, though, because a shorter run takes bigger
+steps. When a run finishes, its first, middle and last generated frames go
+to `progress/<run>.png` and `progress/latest.png`. A run here is one
+`extend` iteration, `bridge` gap, `expand` window or grow pass, or one FLUX
+keyframe. Leave `latest.png` open and kill the job if it's going wrong.
+
+**Kept results.** Every model call's result is kept in `runs/` (lossless)
+or `plates/` (FLUX keyframes, as PNGs). Each is filed under a hash of
+everything that went into the call: the control frames themselves, seed,
+steps, prompt, model and resolution. Running the same command again reuses
+whatever's already there. So:
+
+- A run that crashes or is stopped with Ctrl-C carries on from the last
+  finished call when you re-run it.
+- A run that asks for more of the same builds on what's there. `extend
+  --iterations 6` after `--iterations 3` with the same `--seed` only makes
+  the last three. `expand --grow-step 0.2 --passes 1` stops after the first
+  pass (its frames go to `grow-1.mkv` and `progress/pass-1.png`); running
+  it again without `--passes` carries on from there. A FLUX run carries on
+  from the keyframes already made.
+- Anything that changes a call's inputs makes that call again, and every
+  call after it that it fed into: a new `--steps`, `--prompt` or `--seed`,
+  say. Calls before it are still reused.
+- FLUX keyframes can be **edited by hand**. Paint over
+  `plates/key-002-frame000120-*.png` and re-run: keyframe 2 is used as
+  you left it, and every keyframe after it is made again from your edit.
+- `expand`'s subject analysis (depth and SAM) and quilt plan are kept in
+  `analysis/` too, keyed on the clip and on `dream.py` itself. Trying out
+  `--deform`, `--streak`, `--feather` and the rest on a `--fill dream` run
+  only re-renders.
+
+The work dir can get big: about 0.5MB per generated frame at working size.
+Delete it once you're happy. `--work DIR` puts it somewhere else, and
+`--no-work` turns all of this off.
+
+**Stills.** `expand --stills` renders just a few frames, through the whole
+pipeline at the output's size, with the final composite and dream look,
+and writes them as PNGs to `<work>/stills/`, plus a `sheet.png` of them all,
+instead of the video:
+
+```bash
+uv run soto expand clip.mp4 -o out.mp4 --size 1080x1350 --grow-step 0.2 --stills 3
+uv run soto expand clip.mp4 -o out.mp4 --size 1080x1350 --fill dream --texture flux --stills 0,4.5s
+```
+
+A number is that many frames spread through the clip. A list is frames,
+or times with an `s`, so a single frame needs a trailing comma: `120,`.
+For VACE fills, each still is generated on a short window of
+`config.STILL_WINDOW` (9) frames around it, carried through every grow
+pass, rather than the whole clip, so it takes minutes, not hours. That's a
+different shape of noise from the full run's windows, so the same `--seed`
+won't lay the edges out the same way. Stills are for judging the prompt,
+step count, look and how far the fill reaches. `--preview draft` is still
+the way to see the real layout. FLUX makes the keyframes up to the last
+still and keeps them, so the full run carries on from them. `--fill dream
+--texture quilt` and `mirror` just render those frames. The temporal
+commands have no stills, since each of their frames depends on the whole
+run. Watch their progress PNGs instead.
+
 ## Run metadata
 
 Every command writes a sidecar next to its output (`gen.mkv` gets

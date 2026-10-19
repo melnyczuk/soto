@@ -134,6 +134,9 @@ class RunLog:
             raise
         except BaseException as e:
             self.write_failure(output, e)
+            from soto import workdir
+
+            workdir.interrupted_hint()
             raise
 
     def segment(self, kind: str, start: int, end: int, label: str | None = None, **details) -> None:

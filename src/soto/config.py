@@ -192,6 +192,12 @@ PREVIEW_TIERS: dict[str, tuple[int | None, int]] = {
     "draft": (None, 3),
 }
 
+# `expand --stills`: each still is VACE run on this many frames centred on
+# it (a valid VACE length), not the whole window, and only its middle kept.
+STILL_WINDOW = 9
+# At most this many latent frames tiled into each per-step progress PNG.
+STEP_PREVIEW_FRAMES = 4
+
 # Wan's causal VAE has temporal stride 4 (+1 leading frame); WanVaceToVideo's
 # `length` should satisfy (length - 1) % 4 == 0 for a clean latent frame count.
 VACE_LENGTH_STRIDE = 4

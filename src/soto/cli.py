@@ -7,7 +7,7 @@ from pathlib import Path
 
 import typer
 
-from soto import config
+from soto import config, workdir
 from soto.metadata import RunLog
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -24,6 +24,11 @@ _STEPS_HELP = f"Sampling steps (default {config.DEFAULT_STEPS}, or fewer with --
 _NO_METADATA_HELP = (
     "Don't write the <output>.json sidecar (settings, seeds, timings and the timeline of real, context "
     "and generated frames) or embed its chapter markers in the output."
+)
+_WORK_HELP = (
+    "Where to keep every model result and the progress PNGs (default <output-stem>.work/ beside the output). "
+    "Re-running reuses any result made from exactly the same inputs, so an interrupted run carries on, and "
+    "one asking for more (iterations, passes, keyframes) builds on what's there."
 )
 _GENERATED_NO_METADATA_HELP = _NO_METADATA_HELP + " Without it, `soto crossfade` can't splice the output."
 
@@ -144,6 +149,7 @@ def _preview_note(preview: str | None) -> str:
 def _print_done(output: Path, seed: int | None, preview: str | None, log: RunLog, fps: float, *,
                 generated: bool = True) -> None:
     log.write(output, fps)
+    workdir.finish()
     print(f"Done: {output}" + (f" (seed={seed})" if seed is not None else ""))
     if preview:
         print(f"Preview only -- re-run without --preview and with --seed {seed} for the full-quality version.")
@@ -176,19 +182,45 @@ def _conform_clip(clip: Path, info, tmp_dir: Path, log: RunLog, role: str, *, fp
     return conformed, video.probe(conformed)
 
 
-def _run_vace(context_a, context_b, gap_frames: int, width: int, height: int,
+def _vace(label: str, generated: tuple[int, int], **kwargs):
+    """Runs Wan2.1-VACE (`comfy_engine.run_vace_transition`'s arguments),
+    or takes its result from the work dir if an earlier run already made it
+    from exactly the same inputs. Frames [generated[0], generated[1]) are
+    the ones it's making, for the progress PNGs. Returns (all the decoded
+    frames as uint8, whether they were kept from before)."""
+    from soto import comfy_engine, workdir
+
+    spec = config.MODELS[kwargs["model"]]
+    k = workdir.key(kind="vace", checkpoint=spec.filename, cfg=config.CFG, sampler=config.SAMPLER_NAME,
+                    scheduler=config.SCHEDULER, shift=config.MODEL_SHIFT, denoise=config.DENOISE,
+                    vae=[config.VAE_DEVICE, config.VAE_DTYPE], **kwargs)
+    g0, g1 = generated
+    on_step = workdir.step_preview(label, list(range(workdir.latent_index(g0), workdir.latent_index(g1 - 1) + 1)))
+    frames, kept = workdir.cached_frames(
+        k, label, lambda: comfy_engine.run_vace_transition(**kwargs, on_step=on_step).frames
+    )
+    if kept:
+        print(f"  [cached] {label}: kept from an earlier run")
+    workdir.show(label, frames[g0:g1])
+    return frames, kept
+
+
+def _run_vace(label: str, context_a, context_b, gap_frames: int, width: int, height: int,
               model: str, prompt: str, steps: int, seed: int):
-    """Generates `gap_frames` between two context windows; returns the full
-    decoded sequence (context + gap + context)."""
-    from soto import comfy_engine, video
+    """Generates `gap_frames` between two context windows; returns (the full
+    decoded sequence, context + gap + context, as uint8; whether it was kept
+    from an earlier run)."""
+    from soto import video
 
     control_video, control_mask = video.build_control_batch(context_a, context_b, gap_frames, height, width)
-    return comfy_engine.run_vace_transition(
+    n_a = context_a.shape[0]
+    return _vace(
+        label, (n_a, n_a + gap_frames),
         control_video=control_video,
         control_mask=control_mask,
         width=width,
         height=height,
-        length=context_a.shape[0] + gap_frames + context_b.shape[0],
+        length=n_a + gap_frames + context_b.shape[0],
         model=model,
         prompt=prompt,
         negative_prompt=config.DEFAULT_NEGATIVE_PROMPT,
@@ -336,6 +368,8 @@ def transition(
     preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
     seed: int = typer.Option(None, "--seed", help="Random seed (default: random each run)."),
     no_metadata: bool = typer.Option(False, "--no-metadata", help=_GENERATED_NO_METADATA_HELP),
+    work: Path = typer.Option(None, "--work", file_okay=False, help=_WORK_HELP),
+    no_work: bool = typer.Option(False, "--no-work", help="Don't keep model results or write progress PNGs."),
 ) -> None:
     """Generate an AI-blended transition between two clips, to splice in
     with `soto crossfade`."""
@@ -344,6 +378,7 @@ def transition(
     _check_lossless_output(output)
     log = RunLog("transition", enabled=not no_metadata)
     with log.guard(output):
+        workdir.use(output, work, not no_work)
         area, steps = _resolve_quality(preview, steps, log)
 
         from soto import video
@@ -393,12 +428,13 @@ def transition(
         with log.run(seed=resolved_seed, steps=steps, context_frames_before=n_a, gap_frames=gap_frames,
                      context_frames_after=n_b,
                      context_source_before={"clip": "a", "frames": [info_a.n_frames - n_a, info_a.n_frames]},
-                     context_source_after={"clip": "b", "frames": [0, n_b]}):
-            result = _run_vace(context_a, context_b, gap_frames, width, height, model, prompt, steps, resolved_seed)
+                     context_source_after={"clip": "b", "frames": [0, n_b]}) as run:
+            result, run["cached"] = _run_vace("transition", context_a, context_b, gap_frames, width, height, model,
+                                              prompt, steps, resolved_seed)
 
         print(f"Writing {output}...")
         pieces = _Pieces(fps)
-        pieces.add(result.frames.cpu().numpy())
+        pieces.add(result)
         pieces.write(output)
         # The output is the whole run: context from a, the gap, context from b.
         gap_end = n_a + gap_frames
@@ -436,6 +472,8 @@ def bridge(
     preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
     seed: int = typer.Option(None, "--seed", help="Random seed (default: random each run)."),
     no_metadata: bool = typer.Option(False, "--no-metadata", help=_GENERATED_NO_METADATA_HELP),
+    work: Path = typer.Option(None, "--work", file_okay=False, help=_WORK_HELP),
+    no_work: bool = typer.Option(False, "--no-work", help="Don't keep model results or write progress PNGs."),
 ) -> None:
     """Find blank intervals inside a clip and generate a bridge for each, to
     splice in with `soto crossfade`."""
@@ -444,6 +482,7 @@ def bridge(
     _check_lossless_output(output)
     log = RunLog("bridge", enabled=not no_metadata)
     with log.guard(output):
+        workdir.use(output, work, not no_work)
         area, steps = _resolve_quality(preview, steps, log)
         from soto import video
 
@@ -514,13 +553,14 @@ def bridge(
             context_a = video.read_frames(clip, start - n_a, n_a, width, height)
             context_b = video.read_frames(clip, end, n_b, width, height)
             with log.run(seed=resolved_seed, steps=steps, context_frames_before=n_a, gap_frames=end - start,
-                         context_frames_after=n_b, gap=[start, end]):
-                result = _run_vace(
-                    context_a, context_b, end - start, width, height, model, prompt, steps, resolved_seed
+                         context_frames_after=n_b, gap=[start, end]) as run:
+                result, run["cached"] = _run_vace(
+                    f"bridge-{k}", context_a, context_b, end - start, width, height, model, prompt, steps,
+                    resolved_seed,
                 )
             # Each run goes into the output whole: its context, the bridge,
             # its context.
-            offset = pieces.add(result.frames.cpu().numpy())
+            offset = pieces.add(result)
             gap_start, gap_end = offset + n_a, offset + n_a + (end - start)
             _context_segment(log, offset, n_a, f"context before bridge {k}", "clip", start - n_a, run=k)
             log.segment("generated", gap_start, gap_end, f"bridge {k} (seed {resolved_seed})", run=k)
@@ -569,24 +609,28 @@ def _extend_side(clip: Path, info, n_ctx: int, frames: int, iterations: int, wid
         iter_seed = (seed + i) % 2**32
         run = log.run(side=label, iteration=i + 1, seed=iter_seed, steps=steps, context_frames=n_ctx,
                       gap_frames=frames, context_source="clip" if i == 0 else "generated + clip")
+        # Context is taken from the uint8 frames as kept, so a run carrying
+        # on from kept iterations gives the next one exactly the same context.
         if at_start:
             context = history[:n_ctx]
-            with run:
-                result = _run_vace(empty, context, frames, width, height, model, prompt, steps, iter_seed)
-            chunk = result.frames[:frames].cpu().numpy()
+            with run as entry:
+                result, entry["cached"] = _run_vace(f"start-{i + 1}", empty, context, frames, width, height, model,
+                                                    prompt, steps, iter_seed)
+            chunk = result[:frames]
             if i == 0:
                 # Later iterations only ever join generated frames to generated
                 # frames, so the first seam is the only one with real footage.
-                regenerated = result.frames[frames:].cpu().numpy()
-            history = np.concatenate([chunk, context], axis=0)
+                regenerated = result[frames:]
+            history = np.concatenate([chunk.astype(np.float32) / 255.0, context], axis=0)
         else:
             context = history[-n_ctx:]
-            with run:
-                result = _run_vace(context, empty, frames, width, height, model, prompt, steps, iter_seed)
-            chunk = result.frames[n_ctx:n_ctx + frames].cpu().numpy()
+            with run as entry:
+                result, entry["cached"] = _run_vace(f"end-{i + 1}", context, empty, frames, width, height, model,
+                                                    prompt, steps, iter_seed)
+            chunk = result[n_ctx:n_ctx + frames]
             if i == 0:
-                regenerated = result.frames[:n_ctx].cpu().numpy()
-            history = np.concatenate([context, chunk], axis=0)
+                regenerated = result[:n_ctx]
+            history = np.concatenate([context, chunk.astype(np.float32) / 255.0], axis=0)
         chunks.append(chunk)
     # Extending backwards produces each chunk earlier in time than the last.
     return (chunks[::-1] if at_start else chunks), regenerated
@@ -617,6 +661,8 @@ def extend(
     preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
     seed: int = typer.Option(None, "--seed", help="Random seed (default: random each run)."),
     no_metadata: bool = typer.Option(False, "--no-metadata", help=_GENERATED_NO_METADATA_HELP),
+    work: Path = typer.Option(None, "--work", file_okay=False, help=_WORK_HELP),
+    no_work: bool = typer.Option(False, "--no-work", help="Don't keep model results or write progress PNGs."),
 ) -> None:
     """Generate new frames leading into the start of a clip, continuing on
     from its end, or both, optionally several times over, to add with
@@ -628,6 +674,7 @@ def extend(
     _check_lossless_output(output)
     log = RunLog("extend", enabled=not no_metadata)
     with log.guard(output):
+        workdir.use(output, work, not no_work)
         area, steps = _resolve_quality(preview, steps, log)
         do_start, do_end = side in ("start", "bookend"), side in ("end", "bookend")
 
@@ -1053,6 +1100,26 @@ def _parse_size(value: str) -> tuple[int, int]:
     return video.even_size(w, h)
 
 
+def _parse_stills(spec: str, n_frames: int, fps: float) -> list[int]:
+    """`--stills`: a lone number is that many frames spread evenly through
+    the clip (each in the middle of its stretch); otherwise a comma-separated
+    list of frames, or times in seconds ending in 's'."""
+    items = [i.strip() for i in spec.split(",") if i.strip()]
+    try:
+        if "," not in spec and not spec.strip().endswith("s"):
+            n = int(spec)
+            if n < 1:
+                raise ValueError
+            return sorted({min(n_frames - 1, int((j + 0.5) * n_frames / n)) for j in range(n)})
+        frames = [round(float(i[:-1]) * fps) if i.endswith("s") else int(i) for i in items]
+    except ValueError:
+        raise typer.BadParameter(f"expected a count or frames/times like '0,120,4.5s', not {spec!r}",
+                                 param_hint="--stills") from None
+    if not frames or any(f < 0 or f >= n_frames for f in frames):
+        raise typer.BadParameter(f"frames must be within the clip's 0-{n_frames - 1}", param_hint="--stills")
+    return sorted(set(frames))
+
+
 def _expand_rect(src_w: int, src_h: int, out_w: int, out_h: int, fit: str) -> tuple[int, int, int, int]:
     """Where the source sits in the output, centred: as large as fits for
     'contain', at its own size for 'native'."""
@@ -1079,29 +1146,32 @@ def _scale_rect(rect: tuple[int, int, int, int], sx: float, sy: float, w: int, h
 
 def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int, overlap: int,
                     model: str, prompt: str, steps: int, seed: int, log: RunLog, dream=None,
-                    surround: bool = False) -> list:
-    """Outpaints the whole clip at working resolution, `window` frames per
-    VACE run, each run after the first given the previous one's last
-    `overlap` canvases. Returns one uint8 canvas per frame of the clip.
-    `dream`, a (Focus, DreamLook, QuiltTrack or None) triple, starts VACE
-    from the dream fill instead of a blank border; `surround` pads it with
-    the clip smeared outward instead of white, and steers it off borders."""
+                    surround: bool = False, first: int = 0, count: int | None = None, label: str = "") -> list:
+    """Outpaints the clip's frames [first, first + count) (all of them by
+    default) at working resolution, `window` frames per VACE run, each run
+    after the first given the previous one's last `overlap` canvases.
+    Returns one uint8 canvas per frame. `dream`, a (Focus, DreamLook,
+    QuiltTrack or None) triple, starts VACE from the dream fill instead of a
+    blank border; `surround` pads it with the clip smeared outward instead
+    of white, and steers it off borders. `label` prefixes each run's name in
+    the work dir."""
     import numpy as np
 
-    from soto import comfy_engine, video
+    from soto import video
     from soto import dream as dreaming
 
     x0, y0, x1, y1 = rect
     rw, rh = x1 - x0, y1 - y0
     # The rect is usually a downscale of the source, but not for low-res clips.
     flags = "area" if rw <= info.width else "lanczos"
-    n_windows = 1 + max(0, -(-(info.n_frames - window) // (window - overlap)))
+    end = info.n_frames if count is None else first + count
+    n_windows = 1 + max(0, -(-(end - first - window) // (window - overlap)))
     canvases: list = []
-    start = 0
+    start = first
     for i in range(n_windows):
         given = (np.stack(canvases[-overlap:]).astype(np.float32) / 255.0 if canvases and overlap
                  else np.zeros((0, height, width, 3), dtype=np.float32))
-        n_new = min(window - given.shape[0], info.n_frames - start)
+        n_new = min(window - given.shape[0], end - start)
         frames = video.read_frames(clip, start, n_new, rw, rh, flags=flags)
         # Round the run up to VACE's length stride with copies of the last
         # frame, and drop what they generate.
@@ -1126,8 +1196,9 @@ def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int
         run_seed = (seed + i) % 2**32
         print(f"[{i + 1}/{n_windows}] Running Wan2.1-VACE ({model}) on frames {start}-{start + n_new - 1}...")
         with log.run(window=i + 1, seed=run_seed, steps=steps, frames=[start, start + n_new],
-                     given_frames=given.shape[0], padded_frames=pad, length=length + pad):
-            result = comfy_engine.run_vace_transition(
+                     given_frames=given.shape[0], padded_frames=pad, length=length + pad) as run:
+            result, run["cached"] = _vace(
+                f"{label}frames-{start:06d}-{start + n_new - 1:06d}", (given.shape[0], length),
                 control_video=control_video,
                 control_mask=control_mask,
                 width=width,
@@ -1139,9 +1210,7 @@ def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int
                 steps=steps,
                 seed=run_seed,
             )
-        new = result.frames[given.shape[0]:length].cpu().numpy()
-        # Kept as uint8: a long clip's worth of float canvases adds up.
-        canvases.extend(np.clip(new * 255.0 + 0.5, 0, 255).astype(np.uint8))
+        canvases.extend(result[given.shape[0]:length])
         start += n_new
     return canvases
 
@@ -1173,13 +1242,15 @@ def _grow_boxes(rect, width: int, height: int, step: float) -> list[tuple[int, i
 
 def _expand_grown(clip: Path, info, out_w: int, out_h: int, rect, step: float, area: int | None, window: int,
                   overlap: int, model: str, prompt: str, steps: int, seed: int, log: RunLog,
-                  scratch: Path, keep: Path | None = None, passes: int | None = None) -> list:
-    """Outpaints the clip out to the whole `out_w`x`out_h` canvas a little
-    at a time: each pass VACE fills a ring at most `step` of its frame wide
-    around what the passes before made, so it always has most of its frame
-    to go on. Returns one uint8 canvas per frame, at the output's size.
-    `keep` is a folder to keep each pass's canvases in; `passes` stops after
-    that many (returning nothing), for trying out the first few."""
+                  scratch: Path, keep: Path | None = None, passes: int | None = None, first: int = 0,
+                  count: int | None = None, label: str = "") -> list:
+    """Outpaints the clip's frames [first, first + count) (all of them by
+    default) out to the whole `out_w`x`out_h` canvas a little at a time:
+    each pass VACE fills a ring at most `step` of its frame wide around what
+    the passes before made, so it always has most of its frame to go on.
+    Returns one uint8 canvas per frame, at the output's size. `keep` is a
+    folder to keep each pass's canvases in; `passes` stops after that many
+    (returning nothing), for trying out the first few."""
     import numpy as np
 
     from soto import video
@@ -1199,18 +1270,25 @@ def _expand_grown(clip: Path, info, out_w: int, out_h: int, rect, step: float, a
               f"(working {width}x{height})")
         with log.run(grow_pass=k + 1, box=list(box), working=[width, height]):
             generated = _expand_windows(source, video.probe(source), width, height, work_rect, window, overlap,
-                                        model, prompt, steps, (seed + 1000 * k) % 2**32, log, surround=True)
+                                        model, prompt, steps, (seed + 1000 * k) % 2**32, log, surround=True,
+                                        first=first, count=count, label=f"{label}pass-{k + 1}-")
         frames = video.composite_outpaint(generated, source, known, bw, bh,
-                                          config.EXPAND_SEAM_PX * bw / width)
-        last = k + 1 == len(boxes) or k + 1 == passes
+                                          config.EXPAND_SEAM_PX * bw / width, first=first)
+        # Later passes build out from this one's frames, which start at its first.
+        first, count = 0, None
+        last_box = k + 1 == len(boxes)
+        last = last_box or k + 1 == passes
         if not last or keep is not None:
             # Lossless, for the next pass to build out from.
             source = (keep or scratch) / f"grow-{k + 1}.mkv"
             source.parent.mkdir(parents=True, exist_ok=True)
             video.write_lossless(frames, info.fps, source)
             inner = box
-            if k + 1 == passes:
-                print(f"  stopped after {passes} passes; kept in {keep or scratch}")
+            if k + 1 == passes and not last_box:
+                workdir.show(f"pass-{k + 1}", [video.read_frames(source, i, 1, bw, bh)[0]
+                                               for i in sorted({0, info.n_frames // 2, info.n_frames - 1})])
+                print(f"  stopped after {passes} of {len(boxes)} passes; kept in {source} "
+                      f"(and progress/pass-{k + 1}.png)")
                 return []
             if last:
                 frames = (f.astype(np.float32) / 255.0 for f in video.iter_frames(source, bw, bh))
@@ -1321,7 +1399,21 @@ def expand(
         help="Also write the model's raw canvases, scaled to the output size, before the real footage is laid "
         "back over the middle -- for blending by hand in an editor.",
     ),
+    stills: str = typer.Option(
+        None, "--stills",
+        help="Render just these frames as PNGs, with the full look, instead of the video: a number for that many "
+        "spread evenly through the clip, or a list of frames and times, e.g. '0,120,4.5s' (a single frame needs "
+        "a comma: '120,'). VACE makes each on a short window around it, so it takes minutes, not hours, but "
+        "won't lay out quite as the full run does with the same seed.",
+    ),
+    passes: int = typer.Option(
+        None, "--passes", min=1,
+        help="--grow-step: stop after this many passes and keep them in the work dir, to look at before the rest. "
+        "Running again without it carries on from them.",
+    ),
     no_metadata: bool = typer.Option(False, "--no-metadata", help=_NO_METADATA_HELP),
+    work: Path = typer.Option(None, "--work", file_okay=False, help=_WORK_HELP),
+    no_work: bool = typer.Option(False, "--no-work", help="Don't keep model results or write progress PNGs."),
 ) -> None:
     """Grow a clip's frame to a larger resolution, generating new picture
     around its edges from what's in the frame, with the original centred."""
@@ -1348,11 +1440,17 @@ def expand(
 
     log = RunLog("expand", enabled=not no_metadata)
     with log.guard(output):
+        workdir.use(output, work, not no_work)
         print(f"Probing {clip}...")
         info = video.probe(clip)
+        source = workdir.file_key(clip)
         conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
         clip, info = _conform_clip(clip, info, conform_dir, log, "clip")
         fps = info.fps
+        source.update(fps=fps, width=info.width, height=info.height, frames=info.n_frames)
+        still_frames = _parse_stills(stills, info.n_frames, fps) if stills else None
+        stills_dir = (workdir.active().stills if workdir.active() is not None
+                      else output.with_name(f"{output.stem}.stills"))
         rect = _expand_rect(info.width, info.height, out_w, out_h, fit)
         if rect == (0, 0, out_w, out_h):
             raise typer.BadParameter(
@@ -1373,15 +1471,45 @@ def expand(
                          **({"depth_falloff": depth_falloff} if focus == "depth" else {"focus_falloff": focus_falloff}),
                          "streak": streak, "deform": deform, "wobble": wobble, "texture": texture}
 
+        # The analyses are kept in the work dir, keyed on the clip and on
+        # dream.py itself, so trying out the look only re-renders.
+        analysis_key = {"clip": source, "focus": focus, "code": workdir.source_hash(dreaming)}
+
         def find_subject():
             print(f"Finding the subject ({focus})...")
-            return dreaming.focus_maps(clip, info, depth=focus != "heuristic", segment=focus == "segment")
+            subject, kept = workdir.cached_object(
+                workdir.key(kind="focus", **analysis_key), f"focus-{focus}",
+                lambda: dreaming.focus_maps(clip, info, depth=focus != "heuristic", segment=focus == "segment"),
+            )
+            if kept:
+                print("  [cached] kept from an earlier run")
+            return subject
 
         def plan_quilt(subject, seed: int):
             if texture != "quilt":
                 return None
             print("Quilting the new edges...")
-            return dreaming.plan_quilt(clip, info, subject, rect, out_w, out_h, seed)
+            quilt, kept = workdir.cached_object(
+                workdir.key(kind="quilt", rect=list(rect), size=[out_w, out_h], seed=seed, **analysis_key),
+                "quilt", lambda: dreaming.plan_quilt(clip, info, subject, rect, out_w, out_h, seed),
+            )
+            if kept:
+                print("  [cached] kept from an earlier run")
+            return quilt
+
+        def write_stills(render_one) -> None:
+            """Renders `still_frames` with `render_one(frame)` and writes them."""
+            print(f"Rendering {len(still_frames)} stills: frames {', '.join(map(str, still_frames))}")
+            with log.run(stills=still_frames):
+                workdir.write_stills({f: render_one(f) for f in still_frames}, stills_dir)
+            shutil.rmtree(conform_dir, ignore_errors=True)
+            workdir.finish()
+
+        if passes and not grow_step:
+            print("  note: --passes only applies with --grow-step; ignored")
+        if stills and fill == "blur":
+            print("  note: --stills doesn't apply to --fill blur, which takes seconds anyway; ignored")
+            still_frames = None
 
         # `--fill dream --texture vace` runs VACE first, so it goes the VACE way.
         generated_base = fill == "dream" and texture == "vace"
@@ -1406,11 +1534,27 @@ def expand(
                                              "flux_redenoise": config.FLUX_REDENOISE})
                         print("Outpainting keyframes with FLUX.1 Fill...")
                         plates, seam = dreaming.flux_plates(clip, info, rect, out_w, out_h, prompt, flux_steps,
-                                                            resolved_seed)
+                                                            resolved_seed,
+                                                            until=max(still_frames) if still_frames else None)
+                        if still_frames:
+                            write_stills(lambda f: next(dreaming.over_generated(
+                                plates[f:f + 1], clip, subject, rect, out_w, out_h, look, seam, first=f)))
+                            return
                         print("Rendering dream fill...")
                         frames = dreaming.over_generated(plates, clip, subject, rect, out_w, out_h, look, seam)
                     else:
                         quilt = plan_quilt(subject, resolved_seed)
+                        if still_frames:
+                            x0, y0, x1, y1 = rect
+
+                            def dream_still(f: int):
+                                real = video.read_frames(clip, f, 1, x1 - x0, y1 - y0, flags="lanczos")
+                                window = subject[f:f + 1]
+                                levels = dreaming.blur_levels(window, rect, out_w, out_h, look)
+                                return dreaming.render(real, window, levels, rect, out_w, out_h, look, quilt, f)[0][0]
+
+                            write_stills(dream_still)
+                            return
                         print("Rendering dream fill...")
                         frames = dreaming.dream_frames(clip, info, subject, rect, out_w, out_h, look, quilt)
                     video.write_outpaint(frames, fps, out_w, out_h, clip, output)
@@ -1422,6 +1566,7 @@ def expand(
                         source_frames=[0, info.n_frames])
             shutil.rmtree(conform_dir, ignore_errors=True)
             log.write(output, fps)
+            workdir.finish()
             print(f"Done: {output}" + (f" (seed={resolved_seed})" if resolved_seed is not None else ""))
             return
 
@@ -1454,27 +1599,52 @@ def expand(
             subject = find_subject()
         if dream:
             quilt = plan_quilt(subject, resolved_seed)
-        if grow_step and not dream:
+        grown = grow_step and not dream
+        if grow_step and dream:
+            print("  note: --grow-step doesn't apply to --fill vace-dream; ignored")
+        # Grown canvases are already at the output's size, the clip laid back in each pass.
+        seam = config.EXPAND_SEAM_PX * out_w / (out_w if grown else width)
+
+        def outpaint(win: int = window, lap: int = overlap, **range_) -> list:
+            if grown:
+                return _expand_grown(clip, info, out_w, out_h, rect, grow_step, area, win, lap, model,
+                                     prompt, steps, resolved_seed, log, conform_dir, **range_)
+            return _expand_windows(clip, info, width, height, work_rect, win, lap, model, prompt, steps,
+                                   resolved_seed, log, dream=(subject, look, quilt) if dream else None,
+                                   surround=generated_base, **range_)
+
+        def finish(canvases: list, first: int = 0):
+            if dream:
+                return dreaming.composite(canvases, clip, subject, rect, out_w, out_h, look, quilt, first=first)
+            if generated_base:
+                return dreaming.over_generated(canvases, clip, subject, rect, out_w, out_h, look, seam, first=first)
+            return video.composite_outpaint(canvases, clip, rect, out_w, out_h, seam, first=first)
+
+        if still_frames:
+            def vace_still(f: int):
+                # A short window centred on the still, run on its own.
+                n = min(config.STILL_WINDOW, info.n_frames)
+                first = min(max(0, f - n // 2), info.n_frames - n)
+                canvases = outpaint(n, 0, first=first, count=n, label=f"still-{f:06d}-")
+                return next(iter(finish(canvases[f - first:f - first + 1], first=f)))
+
+            write_stills(vace_still)
+            return
+
+        if grown and passes:
+            wd = workdir.active()
             canvases = _expand_grown(clip, info, out_w, out_h, rect, grow_step, area, window, overlap, model,
-                                     prompt, steps, resolved_seed, log, conform_dir)
-            # Already at the output's size, the clip laid back in each pass.
-            width, height = out_w, out_h
+                                     prompt, steps, resolved_seed, log, conform_dir,
+                                     keep=wd.root if wd is not None else output.parent, passes=passes)
+            if not canvases:
+                shutil.rmtree(conform_dir, ignore_errors=True)
+                workdir.finish()
+                return
         else:
-            if grow_step:
-                print("  note: --grow-step doesn't apply to --fill vace-dream; ignored")
-            canvases = _expand_windows(clip, info, width, height, work_rect, window, overlap, model, prompt,
-                                       steps, resolved_seed, log, dream=(subject, look, quilt) if dream else None,
-                                       surround=generated_base)
+            canvases = outpaint()
 
         print("Compositing final output...")
-        if dream:
-            frames = dreaming.composite(canvases, clip, subject, rect, out_w, out_h, look, quilt)
-        elif generated_base:
-            frames = dreaming.over_generated(canvases, clip, subject, rect, out_w, out_h, look,
-                                             config.EXPAND_SEAM_PX * out_w / width)
-        else:
-            frames = video.composite_outpaint(canvases, clip, rect, out_w, out_h,
-                                              config.EXPAND_SEAM_PX * out_w / width)
+        frames = finish(canvases)
         video.write_outpaint(frames, fps, out_w, out_h, clip, output)
         if export_generated is not None:
             print(f"Exporting generated frames to {export_generated}...")
