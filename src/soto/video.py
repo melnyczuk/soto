@@ -88,9 +88,12 @@ def iter_frames(path: Path, width: int, height: int, flags: str = "area") -> Ite
         while len(raw := proc.stdout.read(frame_size)) == frame_size:
             yield np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
     finally:
-        proc.stdout.close()
+        # Gone before its pipe's closed: otherwise, when a caller stops
+        # early, it can write into the closed pipe first and log a "Broken
+        # pipe" error.
         proc.kill()
         proc.wait()
+        proc.stdout.close()
 
 
 def frame_size(path: Path) -> tuple[int, int]:
@@ -420,19 +423,20 @@ def _mux_audio(video_only: Path, audio_source: Path, output_path: Path, offset_s
 Rect = tuple[int, int, int, int]
 
 
-def build_anamorphic_outpaint_batch(
+def build_bridge_outpaint_batch(
     given: np.ndarray, canvases: np.ndarray, weight: np.ndarray, generate: float | np.ndarray
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The (control_video, control_mask) pair for VACE over the anamorphic look:
-    `canvases` are already whole anamorphic-look frames, masked at `generate`
-    times `weight` (n, h, w, 0-1, how far each pixel is blurred from the
-    clip as it was), so VACE restyles the blur and leaves the subject be.
-    `generate` is a scalar, or (n, 1, 1) to vary it frame by frame (see
-    `PlateTrack.anchor_weights`).
+    """The (control_video, control_mask) pair for VACE carrying the new edges
+    between Flux's keyframes: `canvases` are whole frames, the clip laid over
+    the keyframes' outpainting, masked at `generate` times `weight` ((n or
+    1, h, w), 0-1, how much of each pixel is new picture), so VACE remakes
+    the new edges and leaves the clip be. `generate` is a scalar, or (n, h,
+    w) to vary it by frame and place (see `PlateTrack.bridge_weights`).
     `given` are whole canvases from the previous window, kept as they are
     (mask 0) so the new borders carry on from the old ones."""
     video = np.concatenate([given, canvases], axis=0)
-    mask = np.concatenate([np.zeros(given.shape[:3], dtype=np.float32), generate * weight], axis=0)
+    mask = np.concatenate([np.zeros(given.shape[:3], dtype=np.float32),
+                           np.broadcast_to(generate * weight, canvases.shape[:3])], axis=0)
     return torch.from_numpy(video), torch.from_numpy(mask.astype(np.float32))
 
 

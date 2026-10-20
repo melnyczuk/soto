@@ -207,14 +207,15 @@ VACE_LENGTH_STRIDE = 4
 EXPAND_WINDOW = 81
 EXPAND_OVERLAP = 8
 # The anamorphic look's defaults (see anamorphic.py): blur strength
-# multiplier; how far in from the clip's edges the blur reaches full
-# strength, and how far from the subject the clip's background takes to
-# blur (with `--focus heuristic`), both as fractions of the output's short
-# side; highlight-streak opacity; with depth, how far in depth from the
-# subject the background takes to blur (as a fraction of the frame's depth
-# range); how the subject's found; and how much the new edges bend and drift.
+# multiplier; the lens radius its own softness starts at (1 = half the
+# output's longer side; this is where the reference cow render's softening
+# began); how far from the subject the clip's background takes to blur (with
+# `--focus heuristic`), as a fraction of the output's short side;
+# highlight-streak opacity; with depth, how far in depth from the subject
+# the background takes to blur (as a fraction of the frame's depth range);
+# how the subject's found; and how much the picture bends and drifts.
 ANAMORPHIC_STRENGTH = 1.0
-ANAMORPHIC_FEATHER = 0.35
+ANAMORPHIC_FEATHER = 0.46
 ANAMORPHIC_FALLOFF = 0.3
 ANAMORPHIC_DEPTH_FALLOFF = 0.3
 ANAMORPHIC_FOCUS_MODES = ("segment", "depth", "heuristic")
@@ -223,33 +224,32 @@ ANAMORPHIC_DEFORM = 1.0
 # Drift is scaled by how much the camera moves: none for a held shot.
 ANAMORPHIC_WOBBLE = 0.5
 # How far in from the clip's edges the subject itself starts to blur, as a
-# fraction of the output's short side: it's otherwise kept sharp.
+# fraction of the clip's short side: it's otherwise kept sharp.
 ANAMORPHIC_SUBJECT_EDGE = 0.2
-# Blur levels (see anamorphic.py; 1 = 5% of a 16:9 clip's width, x --anamorphic-strength):
-# the clip's own background away from the subject, the clip's edges, and the
-# far corners of the output. Then how much wider than tall the blur is.
+# Blur levels (see anamorphic.py; 1 = 5% of a 16:9 frame's width, x --anamorphic-strength):
+# the clip's own background away from the subject; where the grade and
+# streaks are full; and the lens's softness at the output's corners. Then how much wider than tall the blur is.
 ANAMORPHIC_BACKGROUND = 0.25
 ANAMORPHIC_EDGE = 0.25
 ANAMORPHIC_FAR = 0.9
 ANAMORPHIC_SQUEEZE = 2.5
 EXPAND_FITS = ("contain", "native")
-# VACE starts from the anamorphic look over Flux's outpainting, masked as the
-# blur comes in, so the picture shows through for VACE to restyle and the
-# subject is left alone. The mask moves with time too: at a Flux keyframe it
-# only reaches EXPAND_ANCHOR_MASK, holding that frame as an anchor, and opens
-# to EXPAND_ANAMORPHIC_MASK midway between two of them, where VACE invents the
-# picture and carries it from one anchor to the next. Both are < 1, so the
-# anchors are restyled as well and there's no pulse between the two.
+# VACE starts from the clip laid over Flux's outpainting, masked over the
+# new picture, so the clip is left alone. The mask moves with time: at a
+# Flux keyframe it only reaches EXPAND_ANCHOR_MASK, holding that frame as an
+# anchor, and opens to EXPAND_BRIDGE_MASK midway between two of them, where
+# VACE invents the picture and carries it from one anchor to the next; but
+# only where the two disagree (see anamorphic.PlateTrack.bridge_weights):
+# where they agree, their crossfade is already right and VACE left free
+# drifts from it. Both
+# are < 1, so the anchors are reworked as well and there's no pulse between
+# the two.
 EXPAND_ANCHOR_MASK = 0.3
-EXPAND_ANAMORPHIC_MASK = 0.8
+EXPAND_BRIDGE_MASK = 0.8
 # How far the new edges' brightness, contrast and colour are matched to the
 # footage beside them after VACE (see blend.py): 1 fully, 0 not at all.
 EXPAND_COLOUR_MATCH = 1.0
-DEFAULT_ANAMORPHIC_PROMPT = (
-    "dreamy out-of-focus edges of the frame as shot through an anamorphic lens, soft horizontal light "
-    "streaks, glowing bokeh, heavily blurred, smooth gradients, soft diffusion"
-)
-# What Flux is asked to paint outside the clip; describing the whole scene helps.
+# What Flux and VACE are asked to paint outside the clip; describing the whole scene helps.
 DEFAULT_EXPAND_PROMPT = (
     "the scene continuing naturally beyond the edges of the frame, consistent lighting and perspective, "
     "coherent scene, smooth continuous motion, high quality"

@@ -1153,15 +1153,17 @@ def _scale_rect(rect: tuple[int, int, int, int], sx: float, sy: float, w: int, h
 
 
 def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int, overlap: int,
-                    model: str, prompt: str, steps: int, seed: int, log: RunLog, focus, look, plates, seam: float,
+                    model: str, prompt: str, steps: int, seed: int, log: RunLog, plates, seam: float,
                     first: int = 0, count: int | None = None, label: str = "") -> list:
     """Outpaints the clip's frames [first, first + count) (all of them by
     default) at working resolution, `window` frames per VACE run, each run
     after the first given the previous one's last `overlap` canvases.
-    Returns one uint8 canvas per frame. VACE starts from the anamorphic look
-    (`focus`, `look`) over Flux's `plates`, which reach `seam` px into the
-    clip (at working size), instead of a blank border. `label` prefixes each
-    run's name in the work dir."""
+    Returns one uint8 canvas per frame. VACE starts from the clip laid over
+    Flux's `plates`, which reach `seam` px into the clip (at working size),
+    instead of a blank border, and carries the new edges from one keyframe
+    to the next; the anamorphic look goes on afterwards, at the output's
+    size (see blend.composite). `label` prefixes each run's name in the work
+    dir."""
     import numpy as np
 
     from soto import video
@@ -1186,19 +1188,17 @@ def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int
         pad = (-(length - 1)) % config.VACE_LENGTH_STRIDE
         if pad:
             frames = np.concatenate([frames, np.repeat(frames[-1:], pad, axis=0)], axis=0)
-        window_focus = focus[start:start + n_new].padded(pad)
-        levels = anamorphic.blur_levels(window_focus, rect, width, height, look)
         base = anamorphic.scaled_plates(plates, start, n_new, width, height, pad)
-        canvas, weight = anamorphic.render(frames, window_focus, levels, rect, width, height, look, base, seam, start)
-        # Held at the Flux keyframes, open between them, so VACE carries the
-        # picture from one anchor to the next instead of following a crossfade.
-        anchor = plates.anchor_weights(start, n_new)
+        canvas = anamorphic.lay_over(frames, base, rect, seam)
+        weight = anamorphic.new_picture(rect, width, height, seam)[None]
+        # Held at the Flux keyframes, open between them where they disagree,
+        # so VACE carries the picture from one anchor to the next instead of
+        # following a crossfade that would ghost; where they agree, it's held.
+        bridge = plates.bridge_weights(start, n_new, width, height)
         if pad:
-            anchor = np.concatenate([anchor, np.repeat(anchor[-1:], pad)])
-        generate = config.EXPAND_ANCHOR_MASK + (config.EXPAND_ANAMORPHIC_MASK - config.EXPAND_ANCHOR_MASK) * anchor
-        control_video, control_mask = video.build_anamorphic_outpaint_batch(
-            given, canvas, weight, generate[:, None, None]
-        )
+            bridge = np.concatenate([bridge, np.repeat(bridge[-1:], pad, axis=0)])
+        generate = config.EXPAND_ANCHOR_MASK + (config.EXPAND_BRIDGE_MASK - config.EXPAND_ANCHOR_MASK) * bridge
+        control_video, control_mask = video.build_bridge_outpaint_batch(given, canvas, weight, generate)
         run_seed = (seed + i) % 2**32
         print(f"[{i + 1}/{n_windows}] Running Wan2.1-VACE ({model}) on frames {start}-{start + n_new - 1}...")
         with log.run(window=i + 1, seed=run_seed, steps=steps, frames=[start, start + n_new],
@@ -1230,10 +1230,7 @@ def expand(
     ),
     prompt: str = typer.Option(
         config.DEFAULT_EXPAND_PROMPT, "--prompt",
-        help="What FLUX.1 Fill paints outside the clip: describe the whole scene.",
-    ),
-    anamorphic_prompt: str = typer.Option(
-        config.DEFAULT_ANAMORPHIC_PROMPT, "--anamorphic-prompt", help="What VACE is asked to turn the blurred edges into."
+        help="What FLUX.1 Fill and VACE paint outside the clip: describe the whole scene.",
     ),
     flux_steps: int = typer.Option(config.FLUX_STEPS, "--flux-steps", min=1, help="FLUX.1 Fill sampling steps."),
     steps: int = typer.Option(None, "--steps", help=f"VACE sampling steps (default {config.DEFAULT_STEPS}, or fewer with --preview)."),
@@ -1253,12 +1250,12 @@ def expand(
     preview: str = typer.Option(None, "--preview", help=_PREVIEW_HELP),
     anamorphic_strength: float = typer.Option(
         config.ANAMORPHIC_STRENGTH, "--anamorphic-strength", min=0.1,
-        help="How wide the blur is at the clip's edge (1 = default).",
+        help="How wide the blur is, in the clip and out to the output's edges (1 = default).",
     ),
     feather: float = typer.Option(
-        config.ANAMORPHIC_FEATHER, "--feather", min=0.01, max=0.5,
-        help="How far in from the clip's edges the blur reaches full strength, as a fraction of the output's "
-        "short side.",
+        config.ANAMORPHIC_FEATHER, "--feather", min=0.0, max=0.7,
+        help="How far off the lens's axis its own softness starts, as a fraction of half the output's longer "
+        "side: lower softens more of the clip.",
     ),
     focus: str = typer.Option(
         config.ANAMORPHIC_FOCUS_MODES[0], "--focus",
@@ -1271,22 +1268,22 @@ def expand(
         config.ANAMORPHIC_DEPTH_FALLOFF, "--depth-falloff", min=0.0, max=1.0,
         help="With --focus segment or depth: how far in depth from the subject the background takes to blur, as "
         "a fraction of the frame's depth range. Lower is a shallower depth of field; 0 leaves the whole clip "
-        "sharp but for --feather.",
+        "sharp but for the lens's own softness (see --feather).",
     ),
     focus_falloff: float = typer.Option(
         config.ANAMORPHIC_FALLOFF, "--focus-falloff", min=0.0, max=1.0,
         help="With --focus heuristic: how far from the subject the clip's own background takes to blur, as a "
-        "fraction of the output's short side. 0 leaves the whole clip sharp but for --feather.",
+        "fraction of the output's short side. 0 leaves the whole clip sharp but for the lens's own softness.",
     ),
     streak: float = typer.Option(
         config.ANAMORPHIC_STREAK, "--streak", min=0.0, max=1.0, help="Opacity of the horizontal light streaks.",
     ),
     deform: float = typer.Option(
         config.ANAMORPHIC_DEFORM, "--deform", min=0.0, max=4.0,
-        help="How much the picture bends, as at the edges of an anamorphic lens: stretched outward (mostly "
-        "sideways) and swirled round the centre, with red and blue drawn apart. It comes in softly from an "
-        "ellipse round the clip's centre, so the clip's own corners bend a little, the subject never does, and "
-        "more the further each part is in depth from the subject (1 = default, 0 = none).",
+        help="How much the picture bends, as off the axis of an anamorphic lens: stretched outward (mostly "
+        "sideways) and swirled round the centre, with red and blue drawn apart. It comes in softly toward the "
+        "output's edges, so a clip that's a small part of the output barely bends; the subject never does, and "
+        "the further each part is in depth from the subject, the more (1 = default, 0 = none).",
     ),
     wobble: float = typer.Option(
         config.ANAMORPHIC_WOBBLE, "--wobble", min=0.0, max=4.0,
@@ -1312,8 +1309,8 @@ def expand(
     no_work: bool = typer.Option(False, "--no-work", help="Don't keep model results or write progress PNGs."),
 ) -> None:
     """Grow a clip's frame to a larger resolution, with the original centred:
-    FLUX.1 Fill outpaints the new edges, an anamorphic blur goes over them, and
-    VACE restyles the blur."""
+    FLUX.1 Fill outpaints the new edges every few seconds, VACE carries them
+    from one to the next, and an anamorphic look goes over the whole frame."""
     if focus not in config.ANAMORPHIC_FOCUS_MODES:
         raise typer.BadParameter(f"must be one of {list(config.ANAMORPHIC_FOCUS_MODES)}", param_hint="--focus")
     if fit not in config.EXPAND_FITS:
@@ -1329,6 +1326,7 @@ def expand(
     import numpy as np
 
     from soto import anamorphic, blend
+    from soto import focus as focus_module
     from soto import video
 
     log = RunLog("expand", enabled=not no_metadata)
@@ -1364,14 +1362,14 @@ def expand(
                          "streak": streak, "deform": deform, "wobble": wobble}
 
         # The analyses are kept in the work dir, keyed on the clip and on
-        # anamorphic.py itself, so trying out the look only re-renders.
-        analysis_key = {"clip": source, "focus": focus, "code": workdir.source_hash(anamorphic)}
+        # focus.py itself, so trying out the look only re-renders.
+        analysis_key = {"clip": source, "focus": focus, "code": workdir.source_hash(focus_module)}
 
         def find_subject():
             print(f"Finding the subject ({focus})...")
             subject, kept = workdir.cached_object(
                 workdir.key(kind="focus", **analysis_key), f"focus-{focus}",
-                lambda: anamorphic.focus_maps(clip, info, depth=focus != "heuristic", segment=focus == "segment"),
+                lambda: focus_module.focus_maps(clip, info, depth=focus != "heuristic", segment=focus == "segment"),
             )
             if kept:
                 print("  [cached] kept from an earlier run")
@@ -1388,14 +1386,14 @@ def expand(
         area, steps = _resolve_quality(preview, steps, log)
         width, height = _fit_working_resolution(out_w, out_h, area)
         work_rect = _scale_rect(rect, width / out_w, height / out_h, width, height)
-        _log_vace_settings(log, model=model, prompt=anamorphic_prompt, steps=steps, preview=preview, width=width,
+        _log_vace_settings(log, model=model, prompt=prompt, steps=steps, preview=preview, width=width,
                            height=height)
         log.settings.update({
             "export_generated": str(export_generated.resolve()) if export_generated else None,
             "source_rect_working": list(work_rect),
             "window": window,
             "overlap": overlap,
-            "anamorphic_mask": config.EXPAND_ANAMORPHIC_MASK,
+            "bridge_mask": config.EXPAND_BRIDGE_MASK,
             "anchor_mask": config.EXPAND_ANCHOR_MASK,
             "colour_match": config.EXPAND_COLOUR_MATCH,
             "flux_prompt": prompt,
@@ -1418,12 +1416,12 @@ def expand(
         work_seam = seam * width / out_w
 
         def outpaint(win: int = window, lap: int = overlap, **range_) -> list:
-            return _expand_windows(clip, info, width, height, work_rect, win, lap, model, anamorphic_prompt, steps,
-                                   resolved_seed, log, subject, look, plates, work_seam, **range_)
+            return _expand_windows(clip, info, width, height, work_rect, win, lap, model, prompt, steps,
+                                   resolved_seed, log, plates, work_seam, **range_)
 
         def finish(canvases: list, first: int = 0, only: list[int] | None = None):
             return blend.composite(canvases, clip, info, subject, rect, work_rect, out_w, out_h, first=first,
-                                   only=only)
+                                   only=only, look=look)
 
         if still_frames:
             def vace_still(f: int):

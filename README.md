@@ -139,7 +139,7 @@ whatever's already there. So:
   `plates/key-002-frame000120-*.png` and re-run: keyframe 2 is used as you
   left it. Each keyframe is made on its own, so none of the others change.
 - `expand`'s subject analysis (depth and SAM) is kept in `analysis/` too,
-  keyed on the clip and on `anamorphic.py` itself. Trying out `--deform`,
+  keyed on the clip and on `focus.py` itself. Trying out `--deform`,
   `--streak`, `--feather` and the rest only re-renders it.
 
 The work dir can get big: about 0.5MB per generated frame at working size.
@@ -351,21 +351,20 @@ It's one pipeline, in four steps:
 
 1. **Subject.** The clip's subject is found (below), so it can be kept sharp.
 2. **FLUX.1 Fill outpaints keyframes.** See below.
-3. **VACE restyles the blur, and bridges between the keyframes.** The
-   anamorphic look goes over the clip and Flux's edges, and Wan2.1-VACE starts
-   from that instead of a blank border. The mask comes in with the blur: none
-   on the subject, opening up at the clip's edges and beyond, so VACE restyles
-   the blur (`--anamorphic-prompt`) and leaves the subject alone. The mask also
-   moves with time. At a Flux keyframe it only opens to 0.3, holding that frame
-   as an anchor; midway between two keyframes it opens to 0.8, where VACE
-   invents the picture and carries it from one anchor to the next. That's what
-   keeps the new edges continuous even though the keyframes are made
-   independently of each other. It works on whole runs of `--window` frames (81
-   by default), each after the first given the previous run's last
-   `--overlap` generated frames (8 by default), so the edges move with the
-   footage and carry on across runs. Run `i` uses `--seed + i`. It works at
-   the usual ~832x480 working resolution (`--model`, `--steps` and
-   `--preview` work as in the other commands).
+3. **VACE bridges between the keyframes.** The clip is laid over Flux's
+   edges, and Wan2.1-VACE starts from that instead of a blank border, masked
+   over the new picture (and the band where the clip fades into it), so it
+   leaves the clip alone. The mask moves with time. At a Flux keyframe it
+   only opens to 0.3, holding that frame as an anchor; midway between two
+   keyframes it opens to 0.8, where VACE invents the picture and carries it
+   from one anchor to the next. That's what keeps the new edges continuous
+   even though the keyframes are made independently of each other. It works
+   on whole runs of `--window` frames (81 by default), each after the first
+   given the previous run's last `--overlap` generated frames (8 by
+   default), so the edges move with the footage and carry on across runs.
+   Run `i` uses `--seed + i`. It works at the usual ~832x480 working
+   resolution (`--model`, `--steps` and `--preview` work as in the other
+   commands), and paints what `--prompt` describes.
 4. **Blend** (`blend.py`). The generated sky comes out of VACE bluer and more
    saturated than the footage's, more so the further it is from the clip. So
    the new edges are matched to the footage first, place by place: their
@@ -379,16 +378,19 @@ It's one pipeline, in four steps:
    sharpness. `config.EXPAND_COLOUR_MATCH` sets how strongly the colour is
    matched. `--export-generated` writes VACE's raw canvases, before any of
    that.
+5. **The anamorphic look** (`anamorphic.py`) goes over the whole frame at
+   `--size`, the clip and the new edges alike, as if one anamorphic lens had
+   shot it all (below).
 
-`--prompt` is what FLUX.1 Fill paints outside the clip: describing the whole
-scene helps. [FLUX.1 Fill
+`--prompt` is what FLUX.1 Fill and VACE paint outside the clip: describing
+the whole scene helps. [FLUX.1 Fill
 [dev]](https://huggingface.co/black-forest-labs/FLUX.1-Fill-dev)
 (non-commercial license; as a Q5 GGUF with its text encoders and VAE, ~14GB,
 fetched by `soto setup --flux`) outpaints a keyframe every two seconds
 of the clip to the whole canvas, starting from the clip smeared outward
 rather than a blank border. Each keyframe is made independently of the
 others, on the same seed, and the frames between crossfade from one to the
-next near the clip while VACE bridges the rest (step 3 above). Chaining them
+next while VACE bridges them (step 3 above). Chaining them
 instead -- each starting from the last one's picture -- flattened the new
 edges a little further every time, and over a clip of any length they washed
 out to flat grey. Flux also redraws a wide band just inside the clip's edge, and
@@ -399,10 +401,15 @@ colour drift, it's matched to each frame broadly, by how the two differ
 along that band, carried on out and fading away from the clip.
 `--flux-steps` (24 by default) and `--seed` set how it's made.
 
-Then everything but the subject is blurred, more the further it is from it,
-lightly in the clip's own background, a little more at the clip's edge, and
-building slowly from there toward the output's corners, so there's no jump
-from the real picture to the new edges.
+The look is a lens over the whole output frame, centred on the clip.
+Everything but the subject softens more the further it is off the lens's
+axis, in a circle round the centre: not at all near the middle, then
+building steadily out to its strongest in the output's corners. So a clip
+that's a small part of the output sits in the sharp middle of the lens and
+gets little of it, and one that nearly fills the output softens toward its
+own corners. The new picture is always at least lightly softened, just
+enough to hide VACE's picture being scaled up, easing off over a band just
+inside the clip, so there's no jump from the real picture to the new edges.
 The blur is two and a half times wider than it is tall, and highlights smear
 into long soft horizontal streaks, as through an anamorphic lens. Where the
 subject runs off the clip's edge, it softens into the fill as itself.
@@ -426,12 +433,13 @@ blended from those either side.
 
 Everything is then blurred by how far it is in depth from the subject, as
 through a lens focused on it, so the ground the subject stands on stays
-sharp while the distance and the near foreground soften. And it bends the picture, as the edges of an anamorphic lens do: stretched
-outward from the centre, much more sideways than up and down, swirled round
+sharp while the distance and the near foreground soften. That depth blur is
+in the clip's own units, as through the same lens whatever's around it. And
+it bends the picture, as an anamorphic lens does off its axis: stretched
+outward from the centre, more sideways than up and down, swirled round
 it, and with red and blue drawn apart into colour fringes. The bend comes in
-very softly from an ellipse round the clip's centre, so the middle stays
-put, the clip's own corners start to bend, and it's strongest at the
-output's corners; it's more the further each part is in depth from the
+very softly with the same lens, so the middle stays put, and it's strongest
+at the output's corners; it's more the further each part is in depth from the
 subject, and never on the subject itself. `--deform` scales it (0 turns it
 off). The bent parts also drift slowly, like heat haze, as much as the
 camera moves: the whole frame's shift is measured as it goes, so a shot on
@@ -457,10 +465,11 @@ water) blurs out toward the edges as a whole.
 `--depth-falloff` is how far in depth from the subject the background takes
 to blur and bend (a fraction of the frame's depth range: lower is a shallower depth
 of field), and `--focus-falloff` the same across the frame for `--focus
-heuristic`. `--feather` is how far in from the clip's edges it reaches the
-edge's blur (a fraction of the output's short side), `--anamorphic-strength` how
-wide the blur is, and `--streak` how bright the streaks are. Either falloff
-at 0 leaves the whole clip sharp but for the feather. If a batch of frames
+heuristic`. `--feather` is how far off the lens's axis its own softness
+starts (a fraction of half the output's longer side: lower softens more of
+the clip), `--anamorphic-strength` how wide the blur is, and `--streak` how
+bright the streaks are. Either falloff at 0 leaves the whole clip sharp but
+for the lens's own softness. If a batch of frames
 comes back from the GPU corrupted (it happens now and then, silently), it's
 noticed and redone.
 

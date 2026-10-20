@@ -1,27 +1,31 @@
-"""The anamorphic look for `soto expand`: the clip's subject stays sharp, and
-everything else is blurred more the further it is from it, out through the
-clip's own background and on into the new edges. The blur is already at the
-fill's strength by the time it reaches the clip's edge, so there's no seam
-where the real picture stops.
+"""The anamorphic look for `soto expand`, as if one anamorphic lens had shot
+the whole output frame: the clip's subject stays sharp, the rest of it is
+defocused by how far it is in depth from the subject, and everything
+softens, bends and fringes more the further it is off the lens's axis. The
+clip sits in the middle of that lens, so the smaller a part of the output it
+is, the less of the look reaches it.
 
-The subject is found with a depth model (Depth Anything V2 Small) and a
-cheap guess at where it is: colour that stands out from the rest of the
-frame, plus local motion and fine detail, with a pull toward the centre.
-The guess picks out the subject, the depth map finds the rest of it, and
-everything else is blurred by how far it is in depth from it, as through a
-lens focused on it. Without depth, the guess alone is the subject, and the
-blur grows with distance from it in the frame instead.
+How far off axis a pixel is, is its lens radius (see `lens_radius`): in
+halves of the output's longer side, round the centre (see _LENS_VERTICAL),
+so 1 is the middle of a landscape output's sides. The blur is worked
+out per pixel as a "level" (see `blur_levels`): 0 is untouched. The field
+softness builds steadily with the lens radius, from --feather to
+ANAMORPHIC_FAR at the output's corners, and the depth blur
+(up to ANAMORPHIC_BACKGROUND) comes from how far each part is from the
+subject in depth (see `focus.py`). Over the new picture and the band where
+the clip meets it, it's never under _SEAM_FLOOR, just enough to hide VACE's
+picture being scaled up. Every part of it is smooth across the clip's
+edges: a step there, split by the fringe, shows as a rainbow line.
 
-Outside the clip is FLUX.1 Fill's outpainting (see `flux_plates`), bent as by
-an anamorphic lens (see `_deform`). The blur is then worked out per pixel as
-a "level": 0 is untouched, and it rises to ANAMORPHIC_EDGE at the clip's edge and
-on to ANAMORPHIC_FAR at the output's corners."""
+The look goes over the whole canvas at the output's size, the clip and the
+new picture alike (VACE's, scaled up, or FLUX.1 Fill's outpainting: see
+`flux_plates` and `lay_over`)."""
 
 from __future__ import annotations
 
 import bisect
 import itertools
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,63 +34,51 @@ import torch
 import torch.nn.functional as F
 
 from soto import config, video
+from soto.focus import Focus, _device, _gauss, _grid, _smoothstep
 
 Rect = tuple[int, int, int, int]
 
-# Long side of the grids the subject is found on and the blur level is worked
-# out on. Both are smooth, so they're upsampled from there.
-_FOCUS_SIZE = 192
-# Long side of the frames the depth model sees; how far in depth from the
-# subject still counts as it (as a fraction of the frame's depth range); and
-# how far from the colour-and-motion guess it can reach, as a fraction of
-# the frame's short side.
-_DEPTH_SIZE = 518
-_DEPTH_TOLERANCE = 0.08
-_SUBJECT_REACH = 0.35
-# Segmenting with SAM: every how many frames, prompted on how fine a grid of
-# points (across, down), keeping objects between these fractions of the
-# frame, and at most this many of them.
-_SEGMENT_EVERY = 3
-_SEGMENT_GRID = (8, 5)
-_SEGMENT_AREA = (0.004, 0.55)
-_SEGMENT_MAX = 3
-# The least score a candidate needs to count as a focus at all: footage with
-# no subject (a landscape) shouldn't have one picked out of it.
-_SEGMENT_MIN = 0.2
+# Long side of the grid the blur level is worked out on. It's smooth, so
+# it's upsampled from there.
 _LEVEL_SIZE = 256
-# The blur at a level of 1, as a fraction of the clip's short side (5% of
-# the width of a 16:9 clip).
+# The blur at a level of 1, as a fraction of a short side (5% of the width
+# of a 16:9 frame): the clip's for its depth blur, as through the same lens
+# whatever the output's size, and the output's for the lens's own softness.
 _EDGE_SIGMA = 0.089
-# The most of a frame that's ever taken for the subject, before it's rounded out.
-_MAX_SUBJECT = 0.2
-# The smear that pads Flux's first keyframe: how many samples it's averaged
+# The lens radius: how much the height counts against the width (1 = a
+# circle; less squashes it, softening more toward the sides than up and down).
+_LENS_VERTICAL = 1.0
+# How the field softness builds, from --feather to ANAMORPHIC_FAR at the
+# output's corners: as this power of the way there, so it comes in gently
+# and builds steadily, with no shelf.
+_FIELD_POWER = 1.5
+# The bend comes in from this lens radius, easing up to full at the
+# output's corners (so the cow's clip sides bend about 0.44 of full).
+_LENS_INNER = 0.42
+# The level is never under _SEAM_FLOOR over the new picture, just enough to
+# hide VACE's picture being scaled up from working size, and along the
+# clip's edges that border it, easing off over _SEAM_BAND of its short side
+# inside it: as far in as blend.py fades the clip's own detail out.
+_SEAM_FLOOR = 0.1
+_SEAM_BAND = 0.12
+# The smear that pads Flux's keyframes: how many samples it's averaged
 # over, reaching how far toward the clip's centre.
 _SMEAR_SAMPLES = 8
 _SMEAR_REACH = 0.85
-# The bend, at --deform 1 and fully out of focus. It comes in over an
-# ellipse round the clip's centre, at the clip's aspect (1 = the middle of
-# its edges): nothing inside _DEFORM_INNER, easing up to full at the
-# output's far corners, so the clip's own corners bend a little too. There:
+# The bend, at --deform 1 and fully out of focus, at the output's corners:
 # how much nearer the centre each point is drawn from, across and down
 # (stretching it outward, mostly sideways), how far it's swirled round, in
 # radians (about 3.5 degrees), and how far red and blue are drawn apart.
-_DEFORM_INNER = 0.45
 _DEFORM_STRETCH_X = 0.12
 _DEFORM_STRETCH_Y = 0.04
 _DEFORM_SWIRL = 0.06
 _FRINGE = 0.008
 # The slow drift of the bent edges at --wobble 1, as a fraction of the
 # clip's short side: a few waves, each (period in seconds, waves across the
-# frame, phase).
+# frame, phase). How much it drifts is set by how much the camera moves
+# (see focus._camera_motion).
 _WOBBLE = 0.01
 _WOBBLE_WAVES = ((3.1, 1.3, 0.0), (4.7, 2.1, 1.9), (6.9, 0.7, 4.2))
-# How much the bent edges drift is set by how much the camera moves: the
-# whole frame's shift over _MOTION_SPAN seconds, as a fraction of its width
-# per second, measured on frames _MOTION_SIZE wide. A shot that holds still
-# doesn't drift at all; one moving _MOTION_FULL or more drifts fully.
-_MOTION_SIZE = 192
-_MOTION_SPAN = 0.2
-_MOTION_FULL = 0.1
 # Above this much bend, a pixel of the clip has moved, so it's left out of
 # the corruption check.
 _BENT = 0.01
@@ -95,46 +87,25 @@ _BENT = 0.01
 # frames by more than _CORRUPT on average, the batch is garbage.
 _UNBLURRED = 0.02
 _CORRUPT = 0.03
-# The clip is left as it was but for this band along its open edges, as a
-# fraction of its short side, where it eases into the new picture.
-_KEEP_BAND = 0.06
+# How much two neighbouring Flux keyframes disagree, place by place (mean
+# difference, 0-1, blurred over this much of the short side), from where VACE
+# is held to the anchor between them to where it's let free to bridge them:
+# keyframes that agree crossfade cleanly, and VACE left free drifts from
+# them (a grey sky turned blue).
+_DISAGREE_BLUR = 0.02
+_DISAGREE = (0.015, 0.06)
 
 
 @dataclass
 class AnamorphicLook:
-    strength: float  # blur at the clip's edge, x 5% of the output width
-    feather: float  # how far in from the clip's edges the blur reaches it, fraction of the short side
+    strength: float  # blur at a level of 1, x 5% of the width
+    feather: float  # the lens radius the field softness starts at (1 = half the output's longer side)
     falloff: float  # how far from the subject the background takes to blur, fraction of the short side
     streak: float  # opacity of the horizontal light streaks
     depth_falloff: float = 0.3  # with depth: how far in depth from the subject the background takes to blur
-    deform: float = 1.0  # how much the new edges bend, as through an anamorphic lens (1 = default)
+    deform: float = 1.0  # how much the picture bends off axis, as through an anamorphic lens (1 = default)
     wobble: float = 1.0  # how much the bent edges drift (1 = default)
     fps: float = 24.0  # the clip's, to time the drift by
-
-
-def _device() -> torch.device:
-    return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-
-
-def _smoothstep(e0: float, e1: float, x: torch.Tensor) -> torch.Tensor:
-    t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0)
-    return t * t * (3.0 - 2.0 * t)
-
-
-def _gauss(x: torch.Tensor, sx: float, sy: float) -> torch.Tensor:
-    """Separable gaussian blur of (n, c, h, w), reflecting at the borders."""
-    c = x.shape[1]
-    for sigma, horizontal in ((sx, True), (sy, False)):
-        r = min(int(3 * sigma), x.shape[-1 if horizontal else -2] - 1)
-        if sigma < 0.3 or r < 1:
-            continue
-        k = torch.exp(-0.5 * (torch.arange(-r, r + 1, device=x.device, dtype=x.dtype) / sigma) ** 2)
-        k = k / k.sum()
-        if horizontal:
-            x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="reflect"), k.view(1, 1, 1, -1).expand(c, 1, 1, -1), groups=c)
-        else:
-            x = F.conv2d(F.pad(x, (0, 0, r, r), mode="reflect"), k.view(1, 1, -1, 1).expand(c, 1, -1, 1), groups=c)
-    return x
 
 
 def _blur(x: torch.Tensor, sx: float, sy: float) -> torch.Tensor:
@@ -147,316 +118,48 @@ def _blur(x: torch.Tensor, sx: float, sy: float) -> torch.Tensor:
     return F.interpolate(_gauss(small, sx / f, sy / f), size=(h, w), mode="bilinear", align_corners=False)
 
 
-def _grid(width: int, height: int, long_side: int) -> tuple[int, int]:
-    s = long_side / max(width, height)
-    return max(8, round(width * s)), max(8, round(height * s))
+def lens_radius(width: int, height: int, device: torch.device | None = None) -> torch.Tensor:
+    """(height, width): how far off the lens's axis each pixel of a
+    `width`x`height` frame is, in halves of its longer side, as the lens's
+    image circle covers that: 1 at the middle of a landscape frame's sides,
+    and a portrait frame's sides nearer in. Up and down count
+    _LENS_VERTICAL as much. The same at any size, so it works on a small grid too."""
+    half = max(width, height) / 2
+    ys = (torch.arange(height, device=device, dtype=torch.float32) + 0.5 - height / 2) / half
+    xs = (torch.arange(width, device=device, dtype=torch.float32) + 0.5 - width / 2) / half
+    return torch.hypot(xs[None, :], _LENS_VERTICAL * ys[:, None])
 
 
-def _ema(x: np.ndarray, keep: float) -> np.ndarray:
-    """Forward-backward exponential smoothing along the first axis, so it
-    doesn't lag behind the footage."""
-    out = x.astype(np.float32)
-    for i in range(1, len(out)):
-        out[i] = keep * out[i - 1] + (1.0 - keep) * out[i]
-    for i in range(len(out) - 2, -1, -1):
-        out[i] = keep * out[i + 1] + (1.0 - keep) * out[i]
-    return out
+def _sigma(level: torch.Tensor) -> torch.Tensor:
+    """A blur level's width, in blurs at a level of 1."""
+    return torch.where(level <= 1.0, level**2, level)
 
 
-def _salience(clip: Path, info: video.ClipInfo, chunk: int = 64) -> np.ndarray:
-    """(n, h, w) float16 in [0, 1], on a small grid at the clip's aspect:
-    how much each part of each frame stands out as the subject, by colour,
-    motion and detail alone."""
-    import kornia
-
-    fw, fh = _grid(info.width, info.height, _FOCUS_SIZE)
-    yy, xx = torch.meshgrid(torch.linspace(-1, 1, fh), torch.linspace(-1, 1, fw), indexing="ij")
-    centre = 0.4 + 0.6 * torch.exp(-(xx**2 + yy**2) / (2 * 0.6**2))
-    weights = torch.tensor([0.5, 1.0, 1.0]).view(1, 3, 1, 1)
-    laplacian = torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]).view(1, 1, 3, 3)
-
-    def unit(x: torch.Tensor, floor: float) -> torch.Tensor:
-        # Per frame, so a 99th-percentile response is 1, but never scaling up
-        # a frame with nothing in it past `floor`.
-        p = torch.quantile(x.flatten(1), 0.99, dim=1).clamp(min=floor)
-        return (x / p.view(-1, 1, 1, 1)).clamp(0.0, 1.5)
-
-    scores: list[np.ndarray] = []
-    prev_l = None
-    frames = video.iter_frames(clip, fw, fh)
-    while batch := [f for _, f in zip(range(chunk), frames)]:
-        x = torch.from_numpy(np.stack(batch)).permute(0, 3, 1, 2).float() / 255.0
-        lab = kornia.color.rgb_to_lab(x)
-        light = lab[:, :1]
-        # Colour that stands out from the frame's typical colour.
-        typical = lab.flatten(2).median(dim=2).values.view(-1, 3, 1, 1)
-        rarity = unit(_gauss((((lab - typical) * weights) ** 2).sum(1, keepdim=True).sqrt(), 1.5, 1.5), 20.0)
-        # Motion against the frame's overall change, so a camera move doesn't
-        # count everywhere at once.
-        before = torch.cat([light[:1] if prev_l is None else prev_l, light[:-1]])
-        diff = _gauss((light - before).abs(), 2.0, 2.0)
-        motion = unit((diff - diff.flatten(1).median(dim=1).values.view(-1, 1, 1, 1)).clamp(min=0.0), 4.0)
-        # Fine detail: what's in focus, if the footage has a shallow depth of field.
-        detail = unit(_gauss(F.conv2d(F.pad(light, (1, 1, 1, 1), mode="replicate"), laplacian).abs(), 2.0, 2.0), 2.0)
-        prev_l = light[-1:]
-        score = (0.6 * rarity + 0.2 * motion + 0.2 * detail)[:, 0] * centre
-        scores.append(score.numpy().astype(np.float16))
-
-    score = torch.from_numpy(_ema(np.concatenate(scores), keep=0.8))
-    # Soft-threshold against each frame's strongest response, so there's
-    # always a subject, but never most of the frame: footage that's all
-    # texture (smoke, water) has no subject to keep, so it blurs out too.
-    rel = score / score.flatten(1).amax(dim=1).clamp(min=1e-3).view(-1, 1, 1)
-    floor = torch.quantile(rel.flatten(1).float(), 1.0 - _MAX_SUBJECT, dim=1).clamp(min=0.3).view(-1, 1, 1)
-    m = _smoothstep(0.0, 1.0, (rel - floor) / 0.35)[:, None]
-    m = _gauss(F.max_pool2d(m, 9, stride=1, padding=4), 2.0, 2.0)[:, 0]
-    return m.clamp(0.0, 1.0).numpy().astype(np.float16)
+def _level(sigma: torch.Tensor) -> torch.Tensor:
+    """The blur level of a width (the inverse of `_sigma`)."""
+    return torch.where(sigma <= 1.0, sigma.clamp(min=0.0).sqrt(), sigma)
 
 
-@dataclass
-class Focus:
-    """Per frame, on a small grid at the clip's aspect: `mask`, how much each
-    part is the subject, and `defocus`, how far it is in depth from the
-    subject (0 = as near as it, 1 = the whole frame's depth range), and
-    `near`, how near it is (0 = farthest, 1 = nearest); both None when
-    found without depth."""
-    mask: np.ndarray
-    defocus: np.ndarray | None = None
-    near: np.ndarray | None = None
-    depth: np.ndarray | None = None  # (n,) the subject's own `near`
-    motion: np.ndarray | None = None  # (n,) how much the camera's moving, 0-1 (see _camera_motion)
-
-    def __len__(self) -> int:
-        return self.mask.shape[0]
-
-    def _map(self, f) -> Focus:
-        return Focus(f(self.mask), *(None if x is None else f(x)
-                                     for x in (self.defocus, self.near, self.depth, self.motion)))
-
-    def __getitem__(self, frames) -> Focus:
-        return self._map(lambda x: x[frames])
-
-    def padded(self, n: int) -> Focus:
-        """With `n` copies of the last frame on the end."""
-        return self._map(lambda x: np.concatenate([x, np.repeat(x[-1:], n, axis=0)], axis=0))
+def _union(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """A soft union of two blur levels: as `1 - (1 - a)(1 - b)` while both
+    are under 1, and never less than the larger."""
+    hi, lo = torch.maximum(a, b), torch.minimum(a, b)
+    return hi + lo * (1.0 - hi).clamp(min=0.0)
 
 
-def _depth(clip: Path, info: video.ClipInfo, width: int, height: int, chunk: int = 8) -> np.ndarray:
-    """(n, height, width) float32 nearness of each frame, with Depth Anything
-    V2: 0 for the farthest, 1 for the nearest of each frame, smoothed over
-    time. It's relative (the model only knows what's nearer than what), so
-    it's spread over each frame's own range."""
-    from tqdm import tqdm
-    from transformers import AutoModelForDepthEstimation
-
-    if not (config.DEPTH_MODEL_DIR / "config.json").is_file():
-        raise FileNotFoundError(f"no depth model in {config.DEPTH_MODEL_DIR}: run `soto setup`, "
-                                "or pass --focus heuristic")
-    dev = _device()
-    model = AutoModelForDepthEstimation.from_pretrained(config.DEPTH_MODEL_DIR).to(dev).eval()
-    # The model works in multiples of its 14px patches.
-    s = _DEPTH_SIZE / max(info.width, info.height)
-    iw, ih = (max(14, round(v * s / 14) * 14) for v in (info.width, info.height))
-    mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=dev).view(1, 3, 1, 1)
-    out = []
-    frames = video.iter_frames(clip, iw, ih)
-    with torch.inference_mode(), tqdm(total=info.n_frames, unit="frame", desc="depth") as bar:
-        while batch := [f for _, f in zip(range(chunk), frames)]:
-            x = torch.from_numpy(np.stack(batch)).to(dev).permute(0, 3, 1, 2).float() / 255.0
-            d = model(pixel_values=(x - mean) / std).predicted_depth[:, None]
-            d = F.interpolate(d, size=(height, width), mode="bilinear", antialias=True, align_corners=False)[:, 0]
-            lo = torch.quantile(d.flatten(1), 0.02, dim=1).view(-1, 1, 1)
-            hi = torch.quantile(d.flatten(1), 0.98, dim=1).view(-1, 1, 1)
-            out.append(((d - lo) / (hi - lo).clamp(min=1e-6)).clamp(0.0, 1.0).cpu().numpy())
-            bar.update(len(batch))
-    return _ema(np.concatenate(out), keep=0.5)
-
-
-def _segment(clip: Path, info: video.ClipInfo, guess: np.ndarray, near: np.ndarray, at_depth: np.ndarray,
-             chunk: int = 4) -> np.ndarray | None:
-    """(n, h, w) float32: the objects that are the frame's focus, segmented
-    with SlimSAM, or None without its weights. Every `_SEGMENT_EVERY`th frame
-    is segmented and the frames between blended from those either side.
-
-    SAM is prompted all over the frame, so every object is a candidate, and
-    each is scored as a focus: how much it stands out in colour and motion
-    (`guess`), whether it's in front of what's around it in depth (an object
-    is; the ground it stands on isn't), how much of it is at the depth of
-    what stands out (`at_depth`) and how much of that it covers, a pull toward
-    the centre, whether it runs along the frame's edge (the ground does; a
-    subject mostly doesn't), and whether it was the focus the last time. The
-    best is kept if it scores well enough at all, and any others nearly as
-    good: several subjects all stay sharp."""
-    from tqdm import tqdm
-    from transformers import SamModel, SamProcessor
-
-    if not (config.SEGMENT_MODEL_DIR / "config.json").is_file():
-        return None
-    dev = _device()
-    model = SamModel.from_pretrained(config.SEGMENT_MODEL_DIR).to(dev).eval()
-    processor = SamProcessor.from_pretrained(config.SEGMENT_MODEL_DIR)
-    n, fh, fw = guess.shape
-    keys = list(range(0, n, _SEGMENT_EVERY))
-    if keys[-1] != n - 1:
-        keys.append(n - 1)
-    # SAM resizes to 1024 on its long side anyway.
-    s = 1024 / max(info.width, info.height)
-    iw, ih = round(info.width * s), round(info.height * s)
-    gy, gx = np.meshgrid((np.arange(_SEGMENT_GRID[1]) + 0.5) / _SEGMENT_GRID[1],
-                         (np.arange(_SEGMENT_GRID[0]) + 0.5) / _SEGMENT_GRID[0], indexing="ij")
-    grid_points = np.stack([gx.ravel() * iw, gy.ravel() * ih], axis=1)
-    yy, xx = np.meshgrid((np.arange(fh) + 0.5) / fh, (np.arange(fw) + 0.5) / fw, indexing="ij")
-
-    found: dict[int, np.ndarray] = {}
-    last = None
-    wanted = set(keys)
-    frames = ((i, f) for i, f in enumerate(video.iter_frames(clip, iw, ih)) if i in wanted)
-    with torch.inference_mode(), tqdm(total=len(keys), unit="frame", desc="segment") as bar:
-        for i, frame in frames:
-            g, nr, d = (torch.from_numpy(x[i].astype(np.float32)) for x in (guess, near, at_depth))
-            # The grid, plus wherever the guess is strongest.
-            py, px = np.unravel_index(np.argsort(guess[i].ravel())[-3:], (fh, fw))
-            points = np.concatenate([grid_points, np.stack([(px + 0.5) / fw * iw, (py + 0.5) / fh * ih], axis=1)])
-            inputs = processor(frame.copy(), input_points=[[[p] for p in points.tolist()]], return_tensors="pt")
-            emb = model.get_image_embeddings(inputs["pixel_values"].float().to(dev))
-            out = model(image_embeddings=emb, input_points=inputs["input_points"].float().to(dev),
-                        multimask_output=True)
-            masks = processor.image_processor.post_process_masks(
-                out.pred_masks.float().cpu(), [[fh, fw]], inputs["reshaped_input_sizes"].tolist(), binarize=True,
-            )[0].reshape(-1, fh, fw).float()
-            quality = out.iou_scores.float().cpu().reshape(-1)
-
-            area = masks.mean(dim=(1, 2))
-            ok = (area > _SEGMENT_AREA[0]) & (area < _SEGMENT_AREA[1])
-            if not ok.any():
-                found[i] = np.zeros((fh, fw), dtype=np.float32)
-                bar.update(1)
-                continue
-            masks, quality, area = masks[ok], quality[ok], area[ok]
-            size = masks.sum(dim=(1, 2)).clamp(min=1.0)
-            stands_out = (masks * g).sum(dim=(1, 2)) / size
-            stands_out = stands_out / stands_out.max().clamp(min=1e-3)
-            ring = F.max_pool2d(masks[:, None], 9, stride=1, padding=4)[:, 0] * (1 - masks)
-            in_front = (masks * nr).sum(dim=(1, 2)) / size - (ring * nr).sum(dim=(1, 2)) / ring.sum(dim=(1, 2)).clamp(min=1.0)
-            in_front = (in_front * 5).clamp(-1.0, 1.0)
-            at = d > 0.5
-            pure = (masks * at).sum(dim=(1, 2)) / size
-            cover = (masks * at).sum(dim=(1, 2)) / at.sum().clamp(min=1)
-            cy = (masks * torch.from_numpy(yy).float()).sum(dim=(1, 2)) / size
-            cx = (masks * torch.from_numpy(xx).float()).sum(dim=(1, 2)) / size
-            central = (1.0 - torch.hypot(cx - 0.5, cy - 0.5) / 0.7).clamp(0.0, 1.0)
-            # The ground, a table top, a hillside run along the frame's edge; a
-            # subject mostly sits inside it.
-            border = torch.cat([masks[:, 0], masks[:, -1], masks[:, :, 0], masks[:, :, -1]], dim=1).mean(dim=1)
-            inside = (1.0 - 2.5 * border).clamp(0.0, 1.0)
-            score = (quality * (0.3 * stands_out + 0.3 * in_front + 0.2 * pure + 0.2 * cover) * (0.7 + 0.3 * central)
-                     * inside)
-            if last is not None:
-                kept = torch.from_numpy(last) > 0.5
-                union = (masks.bool() | kept).sum(dim=(1, 2)).clamp(min=1)
-                score = score + 0.4 * (masks.bool() & kept).sum(dim=(1, 2)) / union
-            order = torch.argsort(score, descending=True)
-            chosen = torch.zeros((fh, fw), dtype=torch.bool)
-            for j in order[:_SEGMENT_MAX].tolist():
-                if score[j] < max(0.75 * score[order[0]], _SEGMENT_MIN):
-                    break
-                m = masks[j].bool()
-                if chosen.any() and (m & chosen).sum() > 0.3 * m.sum():
-                    continue
-                chosen |= m
-            found[i] = chosen.float().numpy()
-            last = found[i]
-            bar.update(1)
-
-    out = np.zeros((n, fh, fw), dtype=np.float32)
-    for a, b in itertools.pairwise(keys):
-        for t in range(a, b + 1):
-            w = (t - a) / max(b - a, 1)
-            out[t] = (1 - w) * found[a] + w * found[b]
-    return _ema(out, keep=0.5)
-
-
-def _camera_motion(clip: Path, info: video.ClipInfo) -> np.ndarray:
-    """(n,) float32, 0-1: how much the camera's moving at each frame. The
-    whole frame's shift from `_MOTION_SPAN` seconds before, found by phase
-    correlation (so a subject moving about in a still frame barely counts,
-    and a pan, a tilt or a shaky hand does), as a fraction of its width per
-    second, against `_MOTION_FULL`, and smoothed over time."""
-    w, h = _grid(info.width, info.height, _MOTION_SIZE)
-    span = max(1, round(info.fps * _MOTION_SPAN))
-    window = torch.hann_window(h)[:, None] * torch.hann_window(w)[None]
-    spectra: list[torch.Tensor] = []
-    speed = np.zeros(info.n_frames, dtype=np.float32)
-    for i, frame in enumerate(video.iter_frames(clip, w, h)):
-        grey = torch.from_numpy(frame.astype(np.float32)).mean(-1) / 255.0
-        spectra.append(torch.fft.rfft2((grey - grey.mean()) * window))
-        if i >= span:
-            r = spectra[-1] * spectra[-1 - span].conj()
-            corr = torch.fft.irfft2(r / r.abs().clamp(min=1e-6), s=(h, w))
-            dy, dx = divmod(int(corr.argmax()), w)
-            dy, dx = (dy - h if dy > h // 2 else dy), (dx - w if dx > w // 2 else dx)
-            speed[i] = np.hypot(dx, dy) / w / (span / info.fps)
-            spectra.pop(0)
-    speed[:span] = speed[span] if info.n_frames > span else 0.0
-    moving = _smoothstep(0.0, _MOTION_FULL, torch.from_numpy(speed)).numpy()
-    return _ema(moving, keep=0.9)
-
-
-def focus_maps(clip: Path, info: video.ClipInfo, depth: bool = True, segment: bool = True) -> Focus:
-    """Finds the subject of each frame. Without `depth`, it's `_salience`'s
-    guess. With it, that guess says roughly where the subject is and how far
-    away. With `segment` too, the subject is the objects SAM finds that are
-    the frame's focus (see `_segment`); without it, or if that finds none,
-    it's what's near the guess at about its depth."""
-    fw, fh = _grid(info.width, info.height, _FOCUS_SIZE)
-    salient = _salience(clip, info)
-    motion = _camera_motion(clip, info)
-    if not depth:
-        return Focus(salient, motion=motion)
-    from scipy.ndimage import distance_transform_edt
-
-    near = _depth(clip, info, fw, fh)
-    guess = salient.astype(np.float32)
-    # The subject's depth: toward the near end of where the guess is, as the
-    # guess spills onto what's behind the subject, steadied over time.
-    subject_depth = np.array([np.percentile(n[g >= 0.5], 75) if (g >= 0.5).any() else np.percentile(n, 75)
-                              for n, g in zip(near, guess, strict=True)], dtype=np.float32)
-    subject_depth = _ema(subject_depth, keep=0.8)
-    defocus = np.abs(near - subject_depth[:, None, None])
-    at_depth = 1.0 - _smoothstep(_DEPTH_TOLERANCE, 2 * _DEPTH_TOLERANCE, torch.from_numpy(defocus)).numpy()
-    # Near the guess: the same depth far across the frame is the ground or a
-    # wall the subject stands on, not the subject.
-    reach = _SUBJECT_REACH * min(fw, fh)
-    dist = np.stack([distance_transform_edt(g < 0.5) if (g >= 0.5).any() else np.full(g.shape, reach * 4)
-                     for g in guess]).astype(np.float32)
-
-    def within(r: float) -> np.ndarray:
-        return 1.0 - _smoothstep(0.5 * r, r, torch.from_numpy(dist)).numpy()
-
-    def soften(x: np.ndarray) -> np.ndarray:
-        return _gauss(torch.from_numpy(x)[:, None], 1.0, 1.0)[:, 0].clamp(0.0, 1.0).numpy().astype(np.float16)
-
-    # The guess only places it: it bleeds into what's around the subject.
-    subject = at_depth * within(reach)
-    objects = _segment(clip, info, guess, near, at_depth) if segment else None
-    if objects is not None:
-        # Where it finds nothing, there's no subject: depth alone would only
-        # pick out the ground.
-        subject = objects
-        # And the subject's depth is the segmented object's.
-        inside = [n[o > 0.5] for n, o in zip(near, subject, strict=True)]
-        segmented_depth = np.array([np.median(x) if x.size > 4 else d for x, d in zip(inside, subject_depth, strict=True)],
-                                   dtype=np.float32)
-        subject_depth = _ema(segmented_depth, keep=0.8)
-        defocus = np.abs(near - subject_depth[:, None, None])
-    mask = soften(subject)
-    return Focus(mask, defocus.astype(np.float16), near.astype(np.float16), subject_depth.astype(np.float32), motion)
+def _field(rho: torch.Tensor, feather: float) -> torch.Tensor:
+    """The lens's own softness at lens radius `rho`, as a blur level in the
+    output's units: 0 inside `feather`, building as _FIELD_POWER of the way
+    from there to the output's corners (the largest `rho`), where it's
+    ANAMORPHIC_FAR."""
+    corner = max(float(rho.max()), feather + 1e-3)
+    return config.ANAMORPHIC_FAR * ((rho - feather) / (corner - feather)).clamp(0.0, 1.0) ** _FIELD_POWER
 
 
 def blur_levels(focus: Focus, rect: Rect, width: int, height: int, look: AnamorphicLook) -> torch.Tensor:
     """(n, 1, gh, gw) blur level over the `width`x`height` canvas for each of
-    `focus`'s frames, on a small grid (see the module docstring)."""
+    `focus`'s frames, on a small grid, in the clip's units (see the module
+    docstring)."""
     from scipy.ndimage import distance_transform_edt
 
     gw, gh = _grid(width, height, _LEVEL_SIZE)
@@ -464,6 +167,7 @@ def blur_levels(focus: Focus, rect: Rect, width: int, height: int, look: Anamorp
     x0, y0, x1, y1 = rect
     gx0, gy0, gx1, gy1 = round(x0 * s), round(y0 * s), max(round(x0 * s) + 1, round(x1 * s)), max(round(y0 * s) + 1, round(y1 * s))
     short = min(gw, gh)
+    clip_short = min(x1 - x0, y1 - y0)
 
     # Distance from the subject, averaged over a few thresholds so it moves
     # smoothly as the subject's outline does.
@@ -493,11 +197,8 @@ def blur_levels(focus: Focus, rect: Rect, width: int, height: int, look: Anamorp
         dist /= 3 * short
         level = config.ANAMORPHIC_BACKGROUND * _smoothstep(0.0, look.falloff, torch.from_numpy(dist))[:, None]
 
-    # Up to ANAMORPHIC_EDGE at the clip's edges that border new picture, and from
-    # there to ANAMORPHIC_FAR beyond them, toward the far corners.
     xs = (torch.arange(gw) + 0.5) / s
     ys = (torch.arange(gh) + 0.5) / s
-    feather = max(1.0, look.feather * min(width, height))
 
     def edge(coord: torch.Tensor, lo: int, hi: int, extent: int) -> torch.Tensor:
         d = torch.full_like(coord, float("inf"))
@@ -507,23 +208,19 @@ def blur_levels(focus: Focus, rect: Rect, width: int, height: int, look: Anamorp
             d = torch.minimum(d, hi - coord)
         return d
 
-    inside = torch.minimum(edge(ys, y0, y1, height)[:, None], edge(xs, x0, x1, width)[None, :])
-    out_x = torch.clamp(torch.maximum(x0 - xs, xs - x1), min=0.0)
-    out_y = torch.clamp(torch.maximum(y0 - ys, ys - y1), min=0.0)
-    beyond = (out_y[:, None] ** 2 + out_x[None, :] ** 2).sqrt()
-    in_rect = beyond == 0
-    rim = 1.0 - _smoothstep(0.0, feather, inside.clamp(min=0.0))
-    # The subject is spared the rim, but for the last stretch before the
-    # edge, so one that's cut off by the frame still softens into the fill.
-    tight = 1.0 - _smoothstep(0.0, config.ANAMORPHIC_SUBJECT_EDGE * min(width, height), inside.clamp(min=0.0))
-    rim = rim * (1.0 - canvas * (1.0 - tight))
-    edge_level = config.ANAMORPHIC_EDGE
-    # Eased, so it carries on from the rim without a kink and builds slowly.
-    far = edge_level + (config.ANAMORPHIC_FAR - edge_level) * _smoothstep(0.0, 1.0, beyond / beyond.max().clamp(min=1.0))
-    # A soft union, so there's no crease where the rim overtakes the
-    # background; and the same outside, so the blur carries straight on
-    # across the clip's edge (rim is 1 there, and `far` the edge's level).
-    return torch.where(in_rect, 1.0 - (1.0 - level) * (1.0 - edge_level * rim), 1.0 - (1.0 - level) * (1.0 - far))
+    # How far in from the clip's edges that border new picture.
+    inside = torch.minimum(edge(ys, y0, y1, height)[:, None], edge(xs, x0, x1, width)[None, :]).clamp(min=0.0)
+    in_rect = (xs[None, :] >= x0) & (xs[None, :] < x1) & (ys[:, None] >= y0) & (ys[:, None] < y1)
+    # The lens's softness, in the output's units, put in the clip's.
+    field = _level(_sigma(_field(lens_radius(gw, gh), look.feather)) * min(width, height) / clip_short)
+    # Never under the floor over the new picture and the seam into it.
+    floor = _SEAM_FLOOR * torch.where(
+        in_rect, 1.0 - _smoothstep(0.0, _SEAM_BAND * clip_short, inside), torch.ones_like(inside))
+    field = torch.maximum(field, floor)
+    # The subject is spared it, but for the last stretch before an open edge,
+    # so one that's cut off by the frame still softens into the new picture.
+    tight = 1.0 - _smoothstep(0.0, config.ANAMORPHIC_SUBJECT_EDGE * clip_short, inside)
+    return _union(level, field * (1.0 - canvas * (1.0 - tight)))
 
 
 def _beyond(rect: Rect, width: int, height: int, device: torch.device) -> torch.Tensor:
@@ -578,23 +275,22 @@ def _edge_alpha(rect: Rect, width: int, height: int, band: float) -> np.ndarray:
 
 def _deform(x: torch.Tensor, rect: Rect, width: int, height: int, amount: torch.Tensor, still: torch.Tensor,
             times: torch.Tensor, wobble: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """`x` (n, c, height, width, colour first) bent as the edges of an
-    anamorphic lens bend: stretched outward from the clip's centre, mostly
-    sideways, swirled round it, with red and blue drawn apart, and drifting
-    slowly at `times` (n,) seconds, `wobble` (n,) as much in each frame.
-    It comes in softly over an ellipse round the clip's centre (see
-    _DEFORM_INNER), so the middle stays put and the clip's own corners bend
-    a little, times `amount` (n, 1, height, width), and never where `still`
-    (the subject) is. Returns it and how bent each
-    pixel is (0-1)."""
+    """`x` (n, c, height, width, colour first) bent as an anamorphic lens
+    bends off its axis: stretched outward from the centre, mostly sideways,
+    swirled round it, with red and blue drawn apart, and drifting slowly at
+    `times` (n,) seconds, `wobble` (n,) as much in each frame. It comes in
+    softly with the lens radius (from _LENS_INNER to full at the output's
+    corners), times `amount` (n, 1, height, width), and never where `still`
+    (the subject) is. `rect` (the clip) sets how far it drifts. Returns it
+    and how bent each pixel is (0-1)."""
     x0, y0, x1, y1 = rect
     dev = x.device
-    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    cx, cy = width / 2, height / 2
     ys = torch.arange(height, device=dev, dtype=torch.float32) + 0.5
     xs = torch.arange(width, device=dev, dtype=torch.float32) + 0.5
     dx, dy = xs[None, :] - cx, ys[:, None] - cy
-    r = torch.hypot(dx / ((x1 - x0) / 2), dy / ((y1 - y0) / 2))
-    t = _smoothstep(_DEFORM_INNER, max(float(r.max()), _DEFORM_INNER + 1e-3), r)[None, None] * amount * (1 - still)
+    rho = lens_radius(width, height, dev)
+    t = _smoothstep(_LENS_INNER, max(float(rho.max()), _LENS_INNER + 1e-3), rho)[None, None] * amount * (1 - still)
     # Sampling from nearer the centre stretches outward; turning the sample
     # point the other way swirls the picture round.
     angle = -_DEFORM_SWIRL * t
@@ -639,75 +335,84 @@ def _mirror_index(n_out: int, lo: int, size: int, device: torch.device) -> torch
     return torch.where(i < size, i, 2 * size - 1 - i)
 
 
-def render(frames: np.ndarray, focus: Focus, levels: torch.Tensor, rect: Rect, width: int, height: int,
-           look: AnamorphicLook, base: np.ndarray, seam: float, start: int = 0) -> tuple[np.ndarray, np.ndarray]:
-    """`frames` (n, rh, rw, 3, 0-1, at `rect`'s size, frame `start` on) on a
-    `width`x`height` canvas, laid over `base` (n, height, width, 3, 0-1: the
-    new edges, scaled up) and feathered into it across `seam` px; and blurred
-    to `levels` (from `blur_levels` for the same `focus`), with the anamorphic
-    grade and streaks coming in with the blur. Everything but the unblurred
-    picture is blurred from a plate with the subject filled in from around it,
-    so the subject doesn't smear into the background.
-    Returns the (n, height, width, 3) canvases and the (n, height, width)
-    blur level relative to the clip's edge, clamped to [0, 1]: how far each
-    pixel is from the clip as it was, for anything blending another picture
-    in.
+def lay_over(frames: np.ndarray, base: np.ndarray, rect: Rect, seam: float) -> np.ndarray:
+    """`frames` (n, rh, rw, 3, 0-1, at `rect`'s size) laid over `base` (n,
+    height, width, 3, 0-1: the new picture, held from a keyframe) and
+    feathered into it across the `seam` px it redrew inside the clip; the
+    base matched to each frame first, broadly, by how the two differ along
+    the clip's edge, carried on out into the new picture and fading away
+    from the clip, as the footage's light and colour drift from the
+    keyframe's. Returns (n, height, width, 3) float32 0-1."""
+    x0, y0, x1, y1 = rect
+    height, width = base.shape[1:3]
+    dev = _device()
+    x = torch.from_numpy(np.ascontiguousarray(frames, dtype=np.float32)).to(dev).permute(0, 3, 1, 2)
+    generated = torch.from_numpy(np.ascontiguousarray(base, dtype=np.float32)).to(dev).permute(0, 3, 1, 2)
+    pad = (x0, width - x1, y0, height - y1)
+    band = torch.zeros((1, 1, height, width), device=dev)
+    band[:, :, y0:y1, x0:x1] = 1.0 - torch.from_numpy(_edge_alpha(rect, width, height, 2 * seam)).to(dev)
+    reach = 2 * max(seam, 8.0)
+    differs = _blur((F.pad(x, pad) - generated) * band, reach, reach)
+    weight = _blur(band, reach, reach)
+    fade = 1.0 - _smoothstep(0.0, 3 * reach, _beyond(rect, width, height, dev))
+    generated = generated + differs / weight.clamp(min=1e-3) * fade * (weight > 1e-3)
+    clip_alpha = torch.zeros((1, 1, height, width), device=dev)
+    clip_alpha[:, :, y0:y1, x0:x1] = torch.from_numpy(_edge_alpha(rect, width, height, max(seam, 1.0))).to(dev)
+    canvas = clip_alpha * F.pad(x, pad) + (1.0 - clip_alpha) * generated
+    return canvas.clamp(0.0, 1.0).permute(0, 2, 3, 1).cpu().numpy()
+
+
+def new_picture(rect: Rect, width: int, height: int, seam: float) -> np.ndarray:
+    """(height, width): how much of each pixel is new picture, 1 outside
+    the clip, easing to 0 across the `seam` px inside its open edges, as
+    `lay_over` feathers it."""
+    x0, y0, x1, y1 = rect
+    out = np.ones((height, width), dtype=np.float32)
+    out[y0:y1, x0:x1] = 1.0 - _edge_alpha(rect, width, height, max(seam, 1.0))
+    return out
+
+
+def render(canvases: np.ndarray, focus: Focus, levels: torch.Tensor, rect: Rect, look: AnamorphicLook,
+           start: int = 0) -> np.ndarray:
+    """The look over `canvases` (n, height, width, 3, 0-1: whole output
+    frames, the clip at `rect`, frame `start` on), blurred to `levels` (from
+    `blur_levels` for the same `focus`) and bent, with the anamorphic grade
+    and streaks coming in with the blur. Everything but the unblurred
+    picture is blurred from a plate with the subject filled in from around
+    it, so the subject doesn't smear into the background.
 
     Now and then MPS hands back a batch of garbage, with no error. Anywhere
     left all but unblurred must come out as it went in, so a batch where it
     doesn't is done again, and then on the CPU."""
     for dev in (_device(), _device(), torch.device("cpu")):
-        out, g, ok = _render(frames, focus, levels, rect, width, height, look, base, seam, start, dev)
+        out, ok = _render(canvases, focus, levels, rect, look, start, dev)
         if ok:
             break
-        print(f"  warning: frames {start}-{start + len(frames) - 1} came back corrupted on {dev.type}; redoing them")
-    return out, g
+        print(f"  warning: frames {start}-{start + len(canvases) - 1} came back corrupted on {dev.type}; redoing them")
+    return out
 
 
-def _render(frames: np.ndarray, focus: Focus, levels: torch.Tensor, rect: Rect, width: int, height: int,
-            look: AnamorphicLook, base: np.ndarray, seam: float, start: int,
-            dev: torch.device) -> tuple[np.ndarray, np.ndarray, bool]:
+def _render(canvases: np.ndarray, focus: Focus, levels: torch.Tensor, rect: Rect, look: AnamorphicLook,
+            start: int, dev: torch.device) -> tuple[np.ndarray, bool]:
     x0, y0, x1, y1 = rect
-    x = torch.from_numpy(np.ascontiguousarray(frames)).to(dev).permute(0, 3, 1, 2)
-    m = torch.from_numpy(focus.mask.astype(np.float32)).to(dev)[:, None]
-    m = F.interpolate(m, size=(y1 - y0, x1 - x0), mode="bilinear", align_corners=False)
-    if focus.near is not None:
-        # Depth goes along as one more channel, so the new edges get the
-        # depth at the clip's edge.
-        near = F.interpolate(torch.from_numpy(focus.near.astype(np.float32)).to(dev)[:, None],
-                             size=(y1 - y0, x1 - x0), mode="bilinear", align_corners=False)
-        x = torch.cat([x, near], dim=1)
-    # Scaled to the clip, not the output, so a wider output isn't blurred more.
-    edge_sigma = max(2.0, _EDGE_SIGMA * min(x1 - x0, y1 - y0) * look.strength)
-    # The new edges are the base's, the clip laid back over them and
-    # feathered across the band the base redrew into it.
+    height, width = canvases.shape[1:3]
+    canvas = torch.from_numpy(np.ascontiguousarray(canvases, dtype=np.float32)).to(dev).permute(0, 3, 1, 2)
+    original = canvas
     pad = (x0, width - x1, y0, height - y1)
-    generated = torch.from_numpy(np.ascontiguousarray(base)).to(dev).permute(0, 3, 1, 2)
-    # The generated picture is held from a keyframe, and the footage's
-    # light and colour drift from it: match it to each frame, broadly,
-    # by how the two differ along the clip's edge, carried on out into
-    # the new picture and fading away from the clip.
-    band = torch.zeros((1, 1, height, width), device=dev)
-    band[:, :, y0:y1, x0:x1] = 1.0 - torch.from_numpy(_edge_alpha(rect, width, height, 2 * seam)).to(dev)
-    reach = 2 * max(seam, 8.0)
-    differs = _blur((F.pad(x[:, :3], pad) - generated) * band, reach, reach)
-    weight = _blur(band, reach, reach)
-    fade = 1.0 - _smoothstep(0.0, 3 * reach, _beyond(rect, width, height, dev))
-    generated = generated + differs / weight.clamp(min=1e-3) * fade * (weight > 1e-3)
-    if focus.near is not None:
-        # Only for how much each part bends: the depth at the clip's edge, carried on outward.
-        generated = torch.cat([generated, F.pad(x[:, 3:], pad, mode="replicate")], dim=1)
-    clip_alpha = torch.zeros((1, 1, height, width), device=dev)
-    clip_alpha[:, :, y0:y1, x0:x1] = torch.from_numpy(_edge_alpha(rect, width, height, max(seam, 1.0))).to(dev)
-    canvas = clip_alpha * F.pad(x, pad) + (1.0 - clip_alpha) * generated
-    m = F.pad(m, pad)
-    if focus.near is not None:
-        canvas, near, x = canvas[:, :3], canvas[:, 3:], x[:, :3]
+
+    def at_clip(a: np.ndarray) -> torch.Tensor:
+        return F.interpolate(torch.from_numpy(a.astype(np.float32)).to(dev)[:, None], size=(y1 - y0, x1 - x0),
+                             mode="bilinear", align_corners=False)
+
+    m = F.pad(at_clip(focus.mask), pad)
+    # Scaled to the clip, not the output: the same lens, whatever's around it.
+    edge_sigma = max(2.0, _EDGE_SIGMA * min(x1 - x0, y1 - y0) * look.strength)
     bent = torch.zeros_like(canvas[:, :1])
     if look.deform > 0:
-        # How out of focus each part is, by its depth: the further from the
-        # subject's, the more it bends.
+        # How out of focus each part is, by its depth (the clip's edge's
+        # carried on outward): the further from the subject's, the more it bends.
         if focus.near is not None and focus.depth is not None:
+            near = F.pad(at_clip(focus.near), pad, mode="replicate")
             subject = torch.from_numpy(focus.depth.astype(np.float32)).to(dev).view(-1, 1, 1, 1)
             out_of_focus = _smoothstep(0.0, max(look.depth_falloff, 1e-3), (near - subject).abs())
         else:
@@ -721,7 +426,6 @@ def _render(frames: np.ndarray, focus: Focus, levels: torch.Tensor, rect: Rect, 
                                look.deform * (0.35 + 0.65 * out_of_focus), m, times, wobble)
         canvas, m = warped.split([3, 1], dim=1)
     level = F.interpolate(levels.to(dev), size=(height, width), mode="bilinear", align_corners=False)
-
     # The plate: the subject filled with the blurred picture around it. But
     # where it's meant to soften (cut off by the clip's edge), it blurs as
     # itself: filled in there, its texture would cut out in a hard line.
@@ -731,10 +435,13 @@ def _render(frames: np.ndarray, focus: Focus, levels: torch.Tensor, rect: Rect, 
     plate = canvas * keep + around * (1.0 - keep)
 
     # Blend between a stack of blurs, so each pixel gets its own amount.
-    sigma = edge_sigma * torch.where(level <= 1.0, level**2, level)
+    sigma = edge_sigma * _sigma(level)
     # Half an octave apart: further apart, and fading between two very
-    # different blurs shows as a band.
-    stack = [0.0, *(edge_sigma * 2 ** (k / 2) for k in range(-8, 1 + max(0, round(2 * np.log2(config.ANAMORPHIC_FAR)))))]
+    # different blurs shows as a band. Up to the widest asked for: the lens's
+    # softness, in the clip's units, can be past a level of 1 when the
+    # output is much bigger than the clip.
+    top = max(0, int(np.ceil(2 * np.log2(max(float(sigma.max()) / edge_sigma, config.ANAMORPHIC_FAR)))))
+    stack = [0.0, *(edge_sigma * 2 ** (k / 2) for k in range(-8, 1 + top))]
     # Each pixel's position in the stack, then a weight on its two nearest.
     pos = sum(((sigma - lo) / (hi - lo)).clamp(0.0, 1.0) for lo, hi in itertools.pairwise(stack))
     out = torch.zeros_like(canvas)
@@ -765,16 +472,8 @@ def _render(frames: np.ndarray, focus: Focus, levels: torch.Tensor, rect: Rect, 
     # Barely blurred, unbent clip comes through all but untouched (the grade
     # and streaks come in with the blur), so it must still match the frames.
     sharp = ((level[:, :, y0:y1, x0:x1] < _UNBLURRED) & (bent[:, :, y0:y1, x0:x1] <= _BENT)).expand(-1, 3, -1, -1)
-    ok = bool(not sharp.any() or (out[:, :, y0:y1, x0:x1] - x)[sharp].abs().mean() < _CORRUPT)
-    # Only the new edges are the look's: the clip comes through as it was
-    # but for a thin band along the edges that border them, and VACE is left
-    # out of it (g = 0 there).
-    keep = torch.zeros((1, 1, height, width), device=dev)
-    keep[:, :, y0:y1, x0:x1] = torch.from_numpy(
-        _edge_alpha(rect, width, height, max(1.0, _KEEP_BAND * min(x1 - x0, y1 - y0)))).to(dev)
-    out = keep * F.pad(x, pad) + (1.0 - keep) * out
-    g = g * (1.0 - keep)
-    return out.permute(0, 2, 3, 1).cpu().numpy(), g[:, 0].cpu().numpy(), ok
+    ok = bool(not sharp.any() or (out - original)[:, :, y0:y1, x0:x1][sharp].abs().mean() < _CORRUPT)
+    return out.permute(0, 2, 3, 1).cpu().numpy(), ok
 
 
 def scaled_plates(plates: Sequence[np.ndarray], start: int, n: int, width: int, height: int,
@@ -783,34 +482,6 @@ def scaled_plates(plates: Sequence[np.ndarray], start: int, n: int, width: int, 
     scaled to `width`x`height`, then `pad` copies of the last."""
     up = video._scale_frames(np.stack(plates[start:start + n]).astype(np.float32) / 255.0, width, height)
     return np.concatenate([up, np.repeat(up[-1:], pad, axis=0)], axis=0) if pad else up
-
-
-def composite(canvases: list[np.ndarray], plates: Sequence[np.ndarray], clip: Path, focus: Focus, rect: Rect,
-              width: int, height: int, look: AnamorphicLook, seam: float, chunk: int = 8,
-              first: int = 0) -> Iterable[np.ndarray]:
-    """The output's frames. The anamorphic look over the clip and Flux's `plates`
-    (every frame of the clip, indexed from 0; `seam` is how far they reach into
-    the clip, at the output's size) at full quality, fading out as the blur
-    comes in, where VACE was asked to restyle it: there, `canvases` (VACE's,
-    uint8, any resolution, of the clip's frames from `first` on) scaled up
-    show instead."""
-    from tqdm import tqdm
-
-    x0, y0, x1, y1 = rect
-    frames = itertools.islice(video.iter_frames(clip, x1 - x0, y1 - y0, flags="lanczos"), first, None)
-    with tqdm(total=len(canvases), unit="frame") as bar:
-        for offset in range(0, len(canvases), chunk):
-            start = first + offset
-            batch = np.stack(canvases[offset:offset + chunk]).astype(np.float32) / 255.0
-            n = batch.shape[0]
-            up = video._scale_frames(batch, width, height)
-            real = np.stack([f for _, f in zip(range(n), frames)]).astype(np.float32) / 255.0
-            window = focus[start:start + n]
-            base, g = render(real, window, blur_levels(window, rect, width, height, look), rect, width, height,
-                             look, scaled_plates(plates, start, n, width, height), seam, start)
-            yield from (1.0 - g[..., None]) * base + g[..., None] * up
-            bar.update(n)
-
 
 
 @dataclass
@@ -851,6 +522,32 @@ class PlateTrack:
         t = np.minimum(i - before, after - i).clip(min=0.0) * 2.0 / np.maximum(after - before, 1.0)
         t = t.clip(0.0, 1.0)
         return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+
+    def bridge_weights(self, start: int, n: int, width: int, height: int) -> np.ndarray:
+        """(n, height, width) how free VACE is over frames [start, start +
+        n), place by place: `anchor_weights`, but only as much as the two
+        keyframes either side disagree there (see _DISAGREE), so where
+        they agree it's held to their crossfade all the way."""
+        weights = self.anchor_weights(start, n)
+        keys = np.asarray(self.keys)
+        out = np.zeros((n, height, width), dtype=np.float32)
+        for j, i in enumerate(range(start, start + n)):
+            k = int(np.clip(np.searchsorted(keys, i, side="right") - 1, 0, len(keys) - 1))
+            if weights[j] > 0 and k + 1 < len(keys):
+                out[j] = weights[j] * self._disagreement(k, width, height)
+        return out
+
+    def _disagreement(self, k: int, width: int, height: int) -> np.ndarray:
+        """(height, width), 0-1: how much keyframes k and k + 1 disagree."""
+        cache = self.__dict__.setdefault("_disagree", {})
+        if (k, width, height) not in cache:
+            a, b = (torch.from_numpy(self.plates[j].astype(np.float32) / 255.0).permute(2, 0, 1)[None]
+                    for j in (k, k + 1))
+            sigma = _DISAGREE_BLUR * min(a.shape[-2:])
+            d = _blur((a - b).abs().mean(1, keepdim=True), sigma, sigma)
+            d = F.interpolate(d, size=(height, width), mode="bilinear", align_corners=False)
+            cache[(k, width, height)] = _smoothstep(*_DISAGREE, d)[0, 0].numpy()
+        return cache[(k, width, height)]
 
 
 def flux_plates(clip: Path, info: video.ClipInfo, rect: Rect, width: int, height: int, prompt: str, steps: int,

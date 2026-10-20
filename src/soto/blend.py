@@ -8,16 +8,18 @@ size) added back over the clip and faded out toward the edges that border
 new picture, where it eases into the edges' softness instead of stopping at
 a line.
 
-Before that, the new edges are matched to the footage: the brightness,
-contrast and colour (mean and spread of each channel in Lab) of a ring of
-them just outside the clip to those of a ring of the clip just inside, the
-subject left out of both, steadied over time. The match is full along the
-clip's edges, fades out into the clip, which is left as it was, and eases
-off further out, so the far edges keep some of their own light.
+Then the anamorphic look goes over the lot at the output's size (see
+anamorphic.py), the clip and the new edges alike, as one lens over the
+whole frame.
 
-Then, optionally, a light pass of the anamorphic look's squeezed blur and
-streaks over the new edges, at working size, in case VACE has smoothed
-them away."""
+Last, the new edges are matched to the footage, place by place: their local
+chroma and hue (grey cloud and haze, and the subject, left out of the
+measure) are set to the footage's, carried out from the clip and steadied
+over time, over the whole frame but the subject (the look reaches into the
+clip too). It's measured on the canvases with the look at working size, so
+the look's light comes through but it can't pull the colour away from the
+footage. (The older
+"ring" match, one transform per frame, is still here for comparison.)"""
 
 from __future__ import annotations
 
@@ -30,8 +32,8 @@ import torch
 import torch.nn.functional as F
 
 from soto import config, video
-from soto.anamorphic import (_EDGE_SIGMA, _KEEP_BAND, AnamorphicLook, Focus, Rect, _beyond, _blur, _edge_alpha,
-                             _gauss, _smoothstep, blur_levels)
+from soto.anamorphic import AnamorphicLook, Rect, _beyond, _blur, _edge_alpha, _smoothstep, blur_levels, render
+from soto.focus import Focus
 
 # Over how much of the clip, in from each edge that borders new picture, its
 # fine detail fades out, as a fraction of its short side.
@@ -49,11 +51,6 @@ _MATCH_SHIFT = (20.0, 15.0, 15.0)
 # _MATCH_FLOOR of full by _MATCH_FADE of its short side out.
 _MATCH_FADE = 1.0
 _MATCH_FLOOR = 1.0
-# How strongly the look's blur and streaks are laid over the new edges again
-# after VACE (0 = not at all), and the blur's width, as a fraction of the
-# blur at the clip's edge.
-_LOOK_PASS = 0.0
-_LOOK_BLUR = 0.5
 # Which match: "ring" (one transform per frame, from rings either side of
 # the clip's edges) or "field" (the colour of the new edges set, place by
 # place, to the footage's, carried out from the clip).
@@ -190,34 +187,6 @@ def match_colour(canvases: np.ndarray, stats: dict[str, np.ndarray], rect: Rect,
     return x + (strength * c)[None, :, :, None] * (matched - x)
 
 
-def look_pass(x: np.ndarray, levels: torch.Tensor, rect: Rect, look: AnamorphicLook,
-              amount: float = _LOOK_PASS) -> np.ndarray:
-    """`x` ((n, h, w, 3) float32 0-1, working size, the clip at `rect`) with
-    the look's squeezed blur and streaks laid over its new edges again, by
-    `amount` and as far as `levels` (from `blur_levels`) blur them; the clip
-    but for the band along its edges is left alone."""
-    if amount <= 0:
-        return x
-    height, width = x.shape[1:3]
-    x0, y0, x1, y1 = rect
-    short = min(x1 - x0, y1 - y0)
-    t = torch.from_numpy(np.ascontiguousarray(x)).permute(0, 3, 1, 2)
-    g = (F.interpolate(levels, size=(height, width), mode="bilinear", align_corners=False)
-         / config.ANAMORPHIC_EDGE).clamp(0.0, 1.0)
-    keep = torch.zeros((1, 1, height, width))
-    keep[:, :, y0:y1, x0:x1] = torch.from_numpy(_edge_alpha(rect, width, height, max(1.0, _KEEP_BAND * short)))
-    g = amount * g * (1.0 - keep)
-    sigma = max(1.0, _LOOK_BLUR * _EDGE_SIGMA * short * look.strength)
-    blurred = _blur(t, sigma, sigma / config.ANAMORPHIC_SQUEEZE)
-    out = t + g * (blurred - t)
-    if look.streak > 0:
-        # As in anamorphic._render: highlights smeared sideways and cooled.
-        hl = _gauss(((blurred - 0.55) / 0.45).clamp(0.0, 1.0), 1.5 * sigma, max(0.25, sigma / 48))
-        hl = hl * torch.tensor([0.75, 0.95, 1.2]).view(1, 3, 1, 1)
-        out = 1.0 - (1.0 - out.clamp(0.0, 1.0)) * (1.0 - (look.streak * g * hl).clamp(0.0, 1.0))
-    return out.clamp(0.0, 1.0).permute(0, 2, 3, 1).numpy()
-
-
 def _spread(v: torch.Tensor, weight: torch.Tensor, sigma: float) -> torch.Tensor:
     """`v` (n, c, h, w) averaged by `weight` (n, 1, h, w) over a gaussian
     `sigma` wide; where there's little weight nearby, eased to the average
@@ -235,13 +204,14 @@ def _colour(lab: torch.Tensor, weight: torch.Tensor, sigma: float) -> torch.Tens
 
 
 def colour_fields(canvases: Sequence[np.ndarray], sources: Sequence[np.ndarray], focus: Focus, rect: Rect,
-                  fps: float, chunk: int = 16) -> np.ndarray:
+                  fps: float, chunk: int = 16, whole: bool = False) -> np.ndarray:
     """Per frame, on a grid `_FIELD_GRID` times smaller than `canvases`
     (uint8, working size), how far to move L, scale chroma (as its log) and
     turn hue (radians) so that the colour of the new edges, place by place,
     is the footage's (`sources`, uint8, at `rect`'s size) carried out from
-    the clip. Grey (clouds, haze) and the subject are left out of both
-    measures. Steadied over time: (n, 3, gh, gw)."""
+    the clip (`whole`: of the whole frame, the clip too, as after the look).
+    Grey (clouds, haze) and the subject are left out of both measures.
+    Steadied over time: (n, 3, gh, gw)."""
     height, width = canvases[0].shape[:2]
     gh, gw = max(2, round(height / _FIELD_GRID)), max(2, round(width / _FIELD_GRID))
     s = gw / width
@@ -270,7 +240,7 @@ def colour_fields(canvases: Sequence[np.ndarray], sources: Sequence[np.ndarray],
             return _smoothstep(*_FIELD_GREY, torch.hypot(lab[:, 1:2], lab[:, 2:3])) * clear
 
         ref = _colour(src, coloured(src) * inside, _FIELD_REACH * short)
-        here = _colour(v, coloured(v) * (1.0 - inside), _FIELD_LOCAL * short)
+        here = _colour(v, coloured(v) * (1.0 if whole else 1.0 - inside), _FIELD_LOCAL * short)
         lift = ref[:, :1] - here[:, :1]
         gain = torch.log(ref[:, 1:2].clamp(min=1.0) / here[:, 1:2].clamp(min=1.0))
         ur, uh = ref[:, 2:], here[:, 2:]
@@ -280,21 +250,25 @@ def colour_fields(canvases: Sequence[np.ndarray], sources: Sequence[np.ndarray],
 
 
 def match_fields(canvases: np.ndarray, fields: np.ndarray, rect: Rect,
-                 strength: float = config.EXPAND_COLOUR_MATCH) -> np.ndarray:
-    """`canvases` ((n, h, w, 3) uint8, working size) with their new edges
-    moved by `fields` (those frames' rows of `colour_fields`), fully outside
-    the clip and fading out across `_DETAIL_BAND` inside it. Returns (n, h,
-    w, 3) float32 0-1."""
+                 strength: float = config.EXPAND_COLOUR_MATCH, where: np.ndarray | None = None) -> np.ndarray:
+    """`canvases` ((n, h, w, 3) uint8 or float32 0-1, any size, the clip at
+    `rect`) with their new edges moved by `fields` (those frames' rows of
+    `colour_fields`), fully outside the clip and fading out across
+    `_DETAIL_BAND` inside it, or by `where` ((n, h, w), 0-1) instead.
+    Returns (n, h, w, 3) float32 0-1."""
     import kornia
 
-    x = canvases.astype(np.float32) / 255.0
+    x = canvases.astype(np.float32) / 255.0 if canvases.dtype == np.uint8 else canvases
     if strength <= 0:
         return x
     height, width = x.shape[1:3]
     x0, y0, x1, y1 = rect
-    c = np.ones((height, width), dtype=np.float32)
-    c[y0:y1, x0:x1] = 1.0 - _edge_alpha(rect, width, height, _DETAIL_BAND * min(x1 - x0, y1 - y0))
-    c = torch.from_numpy(strength * c)
+    if where is None:
+        c = np.ones((height, width), dtype=np.float32)
+        c[y0:y1, x0:x1] = 1.0 - _edge_alpha(rect, width, height, _DETAIL_BAND * min(x1 - x0, y1 - y0))
+        c = torch.from_numpy(strength * c)
+    else:
+        c = torch.from_numpy(strength * where.astype(np.float32))[:, None]
     f = F.interpolate(torch.from_numpy(fields).float(), size=(height, width), mode="bilinear", align_corners=False)
     lift = f[:, :1].clamp(-_FIELD_LIFT, _FIELD_LIFT) * c
     gain = torch.exp(f[:, 1:2].clamp(*np.log(_FIELD_GAIN)) * c)
@@ -315,8 +289,8 @@ def composite(canvases: list[np.ndarray], clip: Path, info: video.ClipInfo, focu
     clip's frames from `first` on) matched to the footage, scaled up, with
     the clip's fine detail laid back over them at `rect`. `only` picks which
     of them (indexes into `canvases`) to make; the colour's steadied over
-    all of them either way. With `look`, its blur and streaks are laid over
-    the new edges again (see `look_pass`)."""
+    all of them either way. Then `look` goes over each whole frame (none
+    without it), and the colour's matched after it."""
     from tqdm import tqdm
 
     x0, y0, x1, y1 = rect
@@ -326,7 +300,19 @@ def composite(canvases: list[np.ndarray], clip: Path, info: video.ClipInfo, focu
     n = len(canvases)
     small = list(itertools.islice(video.iter_frames(clip, wx1 - wx0, wy1 - wy0, flags=flags), first, first + n))
     window = focus[first:first + n]
-    if _MATCH_MODE == "field":
+    # With the look, the colour's matched after it, measured on the canvases
+    # with it at working size: its grade and cool streaks would otherwise
+    # push a sky full of bright cloud bluer and more violet than the footage.
+    after = look is not None and _MATCH_MODE == "field"
+    if after:
+        looked = []
+        for s in range(0, n, chunk):
+            part = window[s:s + chunk]
+            v = np.stack(canvases[s:s + chunk]).astype(np.float32) / 255.0
+            v = render(v, part, blur_levels(part, work_rect, v.shape[2], v.shape[1], look), work_rect, look, first + s)
+            looked.extend(np.clip(v * 255.0 + 0.5, 0, 255).astype(np.uint8))
+        stats = {"fields": colour_fields(looked, small, window, work_rect, info.fps, whole=True)}
+    elif _MATCH_MODE == "field":
         stats = {"fields": colour_fields(canvases, small, window, work_rect, info.fps)}
     else:
         stats = colour_stats(canvases, small, window, work_rect, info.fps)
@@ -339,17 +325,27 @@ def composite(canvases: list[np.ndarray], clip: Path, info: video.ClipInfo, focu
         for s in range(0, len(wanted), chunk):
             idx = wanted[s:s + chunk]
             pick = np.stack([canvases[i] for i in idx])
-            if _MATCH_MODE == "field":
+            if after:
+                v = pick.astype(np.float32) / 255.0
+            elif _MATCH_MODE == "field":
                 v = match_fields(pick, stats["fields"][idx], work_rect, strength)
             else:
                 v = match_colour(pick, {k: a[idx] for k, a in stats.items()}, work_rect, strength)
-            if look is not None and _LOOK_PASS > 0:
-                levels = blur_levels(window[idx], work_rect, v.shape[2], v.shape[1], look)
-                v = look_pass(v, levels, work_rect, look, _LOOK_PASS)
             out = video._scale_frames(v, width, height)
             sharp = np.stack([next(real) for _ in idx]).astype(np.float32) / 255.0
             low = video._scale_frames(np.stack([small[i] for i in idx]).astype(np.float32) / 255.0,
                                       x1 - x0, y1 - y0)
             out[:, y0:y1, x0:x1] += detail * (sharp - low)
-            yield from np.clip(out, 0.0, 1.0)
+            out = np.clip(out, 0.0, 1.0)
+            if look is not None:
+                part = window[idx]
+                out = render(out, part, blur_levels(part, rect, width, height, look), rect, look, first + idx[0])
+            if after:
+                # The look reaches into the clip too, so the whole frame is
+                # matched, all but the subject, which keeps its own colour.
+                subject = F.pad(F.interpolate(torch.from_numpy(part.mask.astype(np.float32))[:, None],
+                                              size=(y1 - y0, x1 - x0), mode="bilinear", align_corners=False),
+                                (x0, width - x1, y0, height - y1))[:, 0].numpy()
+                out = match_fields(out, stats["fields"][idx], rect, strength, where=1.0 - subject)
+            yield from out
             bar.update(len(idx))
