@@ -95,6 +95,9 @@ _BENT = 0.01
 # frames by more than _CORRUPT on average, the batch is garbage.
 _UNBLURRED = 0.02
 _CORRUPT = 0.03
+# The clip is left as it was but for this band along its open edges, as a
+# fraction of its short side, where it eases into the new picture.
+_KEEP_BAND = 0.06
 
 
 @dataclass
@@ -763,6 +766,14 @@ def _render(frames: np.ndarray, focus: Focus, levels: torch.Tensor, rect: Rect, 
     # and streaks come in with the blur), so it must still match the frames.
     sharp = ((level[:, :, y0:y1, x0:x1] < _UNBLURRED) & (bent[:, :, y0:y1, x0:x1] <= _BENT)).expand(-1, 3, -1, -1)
     ok = bool(not sharp.any() or (out[:, :, y0:y1, x0:x1] - x)[sharp].abs().mean() < _CORRUPT)
+    # Only the new edges are the look's: the clip comes through as it was
+    # but for a thin band along the edges that border them, and VACE is left
+    # out of it (g = 0 there).
+    keep = torch.zeros((1, 1, height, width), device=dev)
+    keep[:, :, y0:y1, x0:x1] = torch.from_numpy(
+        _edge_alpha(rect, width, height, max(1.0, _KEEP_BAND * min(x1 - x0, y1 - y0)))).to(dev)
+    out = keep * F.pad(x, pad) + (1.0 - keep) * out
+    g = g * (1.0 - keep)
     return out.permute(0, 2, 3, 1).cpu().numpy(), g[:, 0].cpu().numpy(), ok
 
 
@@ -807,7 +818,7 @@ class PlateTrack:
     """The new edges FLUX.1 Fill made for a few keyframes (`keys`, each
     `plates[k]`, uint8 at working size, the whole canvas), crossfaded
     between them for the frames in between. Indexes like a list of
-    canvases, for `over_generated`."""
+    canvases."""
     plates: list[np.ndarray]
     keys: list[int]
     n_frames: int
@@ -826,21 +837,38 @@ class PlateTrack:
     def __getitem__(self, frames: slice) -> list[np.ndarray]:
         return [self._frame(i) for i in range(*frames.indices(self.n_frames))]
 
+    def anchor_weights(self, start: int, n: int) -> np.ndarray:
+        """(n,) how free VACE is over frames [start, start + n): 0 at a
+        keyframe, where its plate is held as an anchor, easing up to 1 midway
+        between two of them, where VACE has to invent the picture and carry it
+        from one anchor to the next. Frames past the last keyframe are
+        anchored to it."""
+        i = np.arange(start, start + n, dtype=np.float32)
+        keys = np.asarray(self.keys, dtype=np.float32)
+        k = np.clip(np.searchsorted(keys, i, side="right") - 1, 0, len(keys) - 1)
+        before, after = keys[k], keys[np.minimum(k + 1, len(keys) - 1)]
+        # How far to the nearer anchor, against the half-gap it sits in.
+        t = np.minimum(i - before, after - i).clip(min=0.0) * 2.0 / np.maximum(after - before, 1.0)
+        t = t.clip(0.0, 1.0)
+        return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+
 
 def flux_plates(clip: Path, info: video.ClipInfo, rect: Rect, width: int, height: int, prompt: str, steps: int,
                 seed: int, until: int | None = None) -> tuple[PlateTrack, float]:
     """Outpaints a keyframe every `config.FLUX_KEY_SECONDS` of the clip to
     the whole `width`x`height` canvas with FLUX.1 Fill, at a working size
-    near `config.FLUX_AREA`. The first is made from scratch, on the clip
-    smeared outward (see `surround`); each after it starts from the last
-    one's fill and only remakes `config.FLUX_REDENOISE` of it, so the scene
-    keeps its layout as the footage moves on. With `until`, stops at the
-    first keyframe at or past that frame. Returns the plates and the seam to
-    lay the clip back over them with, at the output's size.
+    near `config.FLUX_AREA`. Each is made on its own, from the clip smeared
+    outward (see `surround`) and on the same seed, so nothing compounds from
+    one to the next: chaining them flattened the new edges a little further
+    each time, and over a long clip they washed out to flat grey altogether.
+    They're left to disagree, and VACE carries the picture between them (see
+    `PlateTrack.anchor_weights`). With `until`, stops at the first keyframe at
+    or past that frame. Returns the plates and the seam to lay the clip back
+    over them with, at the output's size.
 
     Each plate is kept in the work dir as a PNG (see `workdir`), so a later
-    run carries on from them, and one edited by hand is used as edited, the
-    keyframes after it made again from it."""
+    run reuses them, and one edited by hand is used as edited without
+    disturbing any other."""
     from soto import comfy_engine, workdir
 
     x0, y0, x1, y1 = rect
@@ -859,22 +887,18 @@ def flux_plates(clip: Path, info: video.ClipInfo, rect: Rect, width: int, height
     mask[wr[1]:wr[3], wr[0]:wr[2]] = 1.0 - _edge_alpha(wr, fw, fh, config.FLUX_SEAM_PX)
 
     print(f"  {len(keys)} keyframes at {fw}x{fh}, {steps} steps each")
+    plate_seed = seed % 2**32
     flux = None
     plates: list[np.ndarray] = []
     wanted = set(keys)
     for n, (i, frame) in enumerate((i, f) for i, f in enumerate(video.iter_frames(clip, rw, rh, flags="area"))
                                    if i in wanted):
         real = frame.astype(np.float32) / 255.0
-        if plates:
-            around = plates[-1].astype(np.float32) / 255.0
-        else:
-            around = surround(real[None], wr, fw, fh)[0]
-        pixels = around.copy()
+        pixels = np.ascontiguousarray(surround(real[None], wr, fw, fh)[0])
         pixels[wr[1]:wr[3], wr[0]:wr[2]] = real
-        denoise = 1.0 if not plates else config.FLUX_REDENOISE
         k = workdir.key(kind="flux", model=config.FLUX_FILL_FILENAME, guidance=config.FLUX_GUIDANCE,
                         sampler=config.FLUX_SAMPLER, scheduler=config.FLUX_SCHEDULER, prompt=prompt, steps=steps,
-                        pixels=pixels, mask=mask, seed=(seed + n) % 2**32, denoise=denoise)
+                        pixels=pixels, mask=mask, seed=plate_seed, denoise=1.0)
         label = f"key-{n:03d}-frame{i:06d}"
 
         def make():
@@ -882,7 +906,7 @@ def flux_plates(clip: Path, info: video.ClipInfo, rect: Rect, width: int, height
             if flux is None:
                 flux = comfy_engine.FluxFill(prompt, steps)
             print(f"  keyframe {n + 1}/{len(keys)} (frame {i})")
-            out = flux.fill(torch.from_numpy(pixels), torch.from_numpy(mask), (seed + n) % 2**32, denoise,
+            out = flux.fill(torch.from_numpy(pixels), torch.from_numpy(mask), plate_seed, 1.0,
                             on_step=workdir.step_preview(label))
             # Inside, its redrawn seam is kept: that's what the clip fades into.
             return out.numpy()[:fh, :fw]

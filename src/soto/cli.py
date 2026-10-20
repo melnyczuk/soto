@@ -1190,8 +1190,14 @@ def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int
         levels = anamorphic.blur_levels(window_focus, rect, width, height, look)
         base = anamorphic.scaled_plates(plates, start, n_new, width, height, pad)
         canvas, weight = anamorphic.render(frames, window_focus, levels, rect, width, height, look, base, seam, start)
+        # Held at the Flux keyframes, open between them, so VACE carries the
+        # picture from one anchor to the next instead of following a crossfade.
+        anchor = plates.anchor_weights(start, n_new)
+        if pad:
+            anchor = np.concatenate([anchor, np.repeat(anchor[-1:], pad)])
+        generate = config.EXPAND_ANCHOR_MASK + (config.EXPAND_ANAMORPHIC_MASK - config.EXPAND_ANCHOR_MASK) * anchor
         control_video, control_mask = video.build_anamorphic_outpaint_batch(
-            given, canvas, weight, config.EXPAND_ANAMORPHIC_MASK
+            given, canvas, weight, generate[:, None, None]
         )
         run_seed = (seed + i) % 2**32
         print(f"[{i + 1}/{n_windows}] Running Wan2.1-VACE ({model}) on frames {start}-{start + n_new - 1}...")
@@ -1322,7 +1328,7 @@ def expand(
 
     import numpy as np
 
-    from soto import anamorphic
+    from soto import anamorphic, blend
     from soto import video
 
     log = RunLog("expand", enabled=not no_metadata)
@@ -1390,11 +1396,12 @@ def expand(
             "window": window,
             "overlap": overlap,
             "anamorphic_mask": config.EXPAND_ANAMORPHIC_MASK,
+            "anchor_mask": config.EXPAND_ANCHOR_MASK,
+            "colour_match": config.EXPAND_COLOUR_MATCH,
             "flux_prompt": prompt,
             "flux_steps": flux_steps,
             "flux_model": config.FLUX_FILL_FILENAME,
             "flux_key_seconds": config.FLUX_KEY_SECONDS,
-            "flux_redenoise": config.FLUX_REDENOISE,
             **look_settings,
         })
         resolved_seed = _resolve_seed(seed, log)
@@ -1414,8 +1421,9 @@ def expand(
             return _expand_windows(clip, info, width, height, work_rect, win, lap, model, anamorphic_prompt, steps,
                                    resolved_seed, log, subject, look, plates, work_seam, **range_)
 
-        def finish(canvases: list, first: int = 0):
-            return anamorphic.composite(canvases, plates, clip, subject, rect, out_w, out_h, look, seam, first=first)
+        def finish(canvases: list, first: int = 0, only: list[int] | None = None):
+            return blend.composite(canvases, clip, info, subject, rect, work_rect, out_w, out_h, first=first,
+                                   only=only)
 
         if still_frames:
             def vace_still(f: int):
@@ -1423,7 +1431,8 @@ def expand(
                 n = min(config.STILL_WINDOW, info.n_frames)
                 first = min(max(0, f - n // 2), info.n_frames - n)
                 canvases = outpaint(n, 0, first=first, count=n, label=f"still-{f:06d}-")
-                return next(iter(finish(canvases[f - first:f - first + 1], first=f)))
+                # The whole window, so the colour match is steadied as in the full run.
+                return next(iter(finish(canvases, first=first, only=[f - first])))
 
             write_stills(vace_still)
             return

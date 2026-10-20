@@ -136,8 +136,8 @@ whatever's already there. So:
   call after it that it fed into: a new `--steps`, `--prompt` or `--seed`,
   say. Calls before it are still reused.
 - FLUX keyframes can be **edited by hand**. Paint over
-  `plates/key-002-frame000120-*.png` and re-run: keyframe 2 is used as
-  you left it, and every keyframe after it is made again from your edit.
+  `plates/key-002-frame000120-*.png` and re-run: keyframe 2 is used as you
+  left it. Each keyframe is made on its own, so none of the others change.
 - `expand`'s subject analysis (depth and SAM) is kept in `analysis/` too,
   keyed on the clip and on `anamorphic.py` itself. Trying out `--deform`,
   `--streak`, `--feather` and the rest only re-renders it.
@@ -351,20 +351,34 @@ It's one pipeline, in four steps:
 
 1. **Subject.** The clip's subject is found (below), so it can be kept sharp.
 2. **FLUX.1 Fill outpaints keyframes.** See below.
-3. **VACE restyles the blur.** The anamorphic look goes over the clip and Flux's
-   edges, and Wan2.1-VACE starts from that instead of a blank border. The
-   mask comes in with the blur: none on the subject, rising to 0.8 at the
-   clip's edges and beyond, so VACE restyles the blur (`--anamorphic-prompt`) and
-   leaves the subject alone. It works on whole runs of `--window` frames (81
+3. **VACE restyles the blur, and bridges between the keyframes.** The
+   anamorphic look goes over the clip and Flux's edges, and Wan2.1-VACE starts
+   from that instead of a blank border. The mask comes in with the blur: none
+   on the subject, opening up at the clip's edges and beyond, so VACE restyles
+   the blur (`--anamorphic-prompt`) and leaves the subject alone. The mask also
+   moves with time. At a Flux keyframe it only opens to 0.3, holding that frame
+   as an anchor; midway between two keyframes it opens to 0.8, where VACE
+   invents the picture and carries it from one anchor to the next. That's what
+   keeps the new edges continuous even though the keyframes are made
+   independently of each other. It works on whole runs of `--window` frames (81
    by default), each after the first given the previous run's last
    `--overlap` generated frames (8 by default), so the edges move with the
    footage and carry on across runs. Run `i` uses `--seed + i`. It works at
    the usual ~832x480 working resolution (`--model`, `--steps` and
    `--preview` work as in the other commands).
-4. **Composite.** VACE's result is scaled up to `--size`, and laid over the
-   anamorphic look at full quality, fading in as the blur does. So the clip's
-   own picture is never touched but for the look. `--export-generated`
-   writes VACE's raw canvases, before any of that.
+4. **Blend** (`blend.py`). The generated sky comes out of VACE bluer and more
+   saturated than the footage's, more so the further it is from the clip. So
+   the new edges are matched to the footage first, place by place: their
+   local chroma and hue (clouds and other near-greys, and the subject, left
+   out of the measure) are set to the footage's, carried out from the clip
+   and steadied over time. Brightness is left as VACE made it. Then VACE's
+   canvas is scaled up to `--size`, and the clip's fine detail (the clip
+   less the clip as VACE saw it) is added back over it, fading out toward
+   the edges that border new picture. VACE's canvas already runs the clip
+   into the new edges without a line, so this keeps that, at full
+   sharpness. `config.EXPAND_COLOUR_MATCH` sets how strongly the colour is
+   matched. `--export-generated` writes VACE's raw canvases, before any of
+   that.
 
 `--prompt` is what FLUX.1 Fill paints outside the clip: describing the whole
 scene helps. [FLUX.1 Fill
@@ -372,10 +386,12 @@ scene helps. [FLUX.1 Fill
 (non-commercial license; as a Q5 GGUF with its text encoders and VAE, ~14GB,
 fetched by `soto setup --flux`) outpaints a keyframe every two seconds
 of the clip to the whole canvas, starting from the clip smeared outward
-rather than a blank border. Each keyframe after the first starts from the
-last one's picture and only remakes part of it, so the scene keeps its
-layout as the footage moves on, and the frames between crossfade from one
-to the next. Flux also redraws a wide band just inside the clip's edge, and
+rather than a blank border. Each keyframe is made independently of the
+others, on the same seed, and the frames between crossfade from one to the
+next near the clip while VACE bridges the rest (step 3 above). Chaining them
+instead -- each starting from the last one's picture -- flattened the new
+edges a little further every time, and over a clip of any length they washed
+out to flat grey. Flux also redraws a wide band just inside the clip's edge, and
 the clip fades into that over the band, so it fades into Flux's own version
 of itself rather than straight into a different picture. And since the
 generated picture is held from one keyframe while the footage's light and

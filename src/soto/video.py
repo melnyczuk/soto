@@ -421,12 +421,14 @@ Rect = tuple[int, int, int, int]
 
 
 def build_anamorphic_outpaint_batch(
-    given: np.ndarray, canvases: np.ndarray, weight: np.ndarray, generate: float
+    given: np.ndarray, canvases: np.ndarray, weight: np.ndarray, generate: float | np.ndarray
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The (control_video, control_mask) pair for VACE over the anamorphic look:
     `canvases` are already whole anamorphic-look frames, masked at `generate`
     times `weight` (n, h, w, 0-1, how far each pixel is blurred from the
     clip as it was), so VACE restyles the blur and leaves the subject be.
+    `generate` is a scalar, or (n, 1, 1) to vary it frame by frame (see
+    `PlateTrack.anchor_weights`).
     `given` are whole canvases from the previous window, kept as they are
     (mask 0) so the new borders carry on from the old ones."""
     video = np.concatenate([given, canvases], axis=0)

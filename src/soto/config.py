@@ -112,9 +112,8 @@ FLUX_VAE_REPO = "Comfy-Org/Lumina_Image_2.0_Repackaged"
 FLUX_VAE_REMOTE_PATH = "split_files/vae/ae.safetensors"
 FLUX_VAE_FILENAME = "flux_ae.safetensors"
 # How it's run: working area (at the output's aspect), steps, guidance (Fill
-# wants it high), sampler; a keyframe every this many seconds, each after the
-# first started from the last one's fill and remade this much of the way, so
-# the scene keeps its layout; and how far into the clip it may redraw, at
+# wants it high), sampler; a keyframe every this many seconds, each made
+# independently of the others; and how far into the clip it may redraw, at
 # working size, to blend its edge: wide, so the clip fades into Flux's own
 # redraw of it over a long way rather than into a different picture.
 FLUX_AREA = 1024 * 1024
@@ -123,7 +122,6 @@ FLUX_GUIDANCE = 30.0
 FLUX_SAMPLER = "euler"
 FLUX_SCHEDULER = "normal"
 FLUX_KEY_SECONDS = 2.0
-FLUX_REDENOISE = 0.6
 FLUX_SEAM_PX = 96
 
 # `soto train` defaults. pix2pixHD's own: Adam at 2e-4 with beta1 0.5, held
@@ -235,10 +233,18 @@ ANAMORPHIC_EDGE = 0.25
 ANAMORPHIC_FAR = 0.9
 ANAMORPHIC_SQUEEZE = 2.5
 EXPAND_FITS = ("contain", "native")
-# VACE starts from the anamorphic look over Flux's outpainting, masked up to
-# EXPAND_ANAMORPHIC_MASK (<1) as the blur comes in, so the picture shows through
-# for VACE to restyle and the subject is left alone.
+# VACE starts from the anamorphic look over Flux's outpainting, masked as the
+# blur comes in, so the picture shows through for VACE to restyle and the
+# subject is left alone. The mask moves with time too: at a Flux keyframe it
+# only reaches EXPAND_ANCHOR_MASK, holding that frame as an anchor, and opens
+# to EXPAND_ANAMORPHIC_MASK midway between two of them, where VACE invents the
+# picture and carries it from one anchor to the next. Both are < 1, so the
+# anchors are restyled as well and there's no pulse between the two.
+EXPAND_ANCHOR_MASK = 0.3
 EXPAND_ANAMORPHIC_MASK = 0.8
+# How far the new edges' brightness, contrast and colour are matched to the
+# footage beside them after VACE (see blend.py): 1 fully, 0 not at all.
+EXPAND_COLOUR_MATCH = 1.0
 DEFAULT_ANAMORPHIC_PROMPT = (
     "dreamy out-of-focus edges of the frame as shot through an anamorphic lens, soft horizontal light "
     "streaks, glowing bokeh, heavily blurred, smooth gradients, soft diffusion"
