@@ -327,7 +327,8 @@ def doctor() -> None:
     print(f"[{'ok' if te_ok else 'FAIL'}] models/text_encoders/{config.TEXT_ENCODER_FILENAME} (run `soto setup`)")
     ok &= te_ok
 
-    for kind, path in (("depth", config.DEPTH_MODEL_DIR), ("segment", config.SEGMENT_MODEL_DIR)):
+    for kind, path in (("depth", config.DEPTH_MODEL_DIR), ("segment", config.SEGMENT_MODEL_DIR),
+                       ("caption", config.CAPTION_MODEL_DIR)):
         present = (path / "config.json").is_file()
         print(f"[{'ok' if present else 'warn'}] models/{kind}/{path.name} for `soto expand` "
               "(run `soto setup`)")
@@ -1221,6 +1222,23 @@ def _expand_windows(clip: Path, info, width: int, height: int, rect, window: int
     return canvases
 
 
+def _caption_prompt(clip: Path, info, source: dict, caption_module) -> tuple[str, str, str | None]:
+    """`expand`'s prompt when --prompt isn't given: a caption of the clip,
+    kept in the work dir, in front of the generic tail; or the tail alone if
+    the caption model isn't there. Returns (prompt, source, caption)."""
+    print("Captioning the clip (Qwen3.5)...")
+    try:
+        caption, kept = workdir.cached_object(
+            workdir.key(kind="caption", clip=source, code=workdir.source_hash(caption_module)), "caption",
+            lambda: caption_module.caption_clip(clip, info),
+        )
+    except FileNotFoundError as e:
+        print(f"  warning: {e}; using the generic prompt")
+        return config.DEFAULT_EXPAND_PROMPT, "default", None
+    print(f"  {'[cached] ' if kept else ''}{caption}")
+    return f"{caption}, {config.EXPAND_PROMPT_TAIL}", "caption", caption
+
+
 @app.command()
 def expand(
     clip: Path = typer.Argument(..., exists=True, help="Clip to expand."),
@@ -1229,8 +1247,9 @@ def expand(
         None, "-o", "--output", help="Output video path (default outputs/<clip name>-expanded.mp4)."
     ),
     prompt: str = typer.Option(
-        config.DEFAULT_EXPAND_PROMPT, "--prompt",
-        help="What FLUX.1 Fill and VACE paint outside the clip: describe the whole scene.",
+        None, "--prompt",
+        help="What FLUX.1 Fill and VACE paint outside the clip: describe the whole scene (default: a caption "
+        "of the clip by Qwen3.5, plus a generic tail).",
     ),
     flux_steps: int = typer.Option(config.FLUX_STEPS, "--flux-steps", min=1, help="FLUX.1 Fill sampling steps."),
     steps: int = typer.Option(None, "--steps", help=f"VACE sampling steps (default {config.DEFAULT_STEPS}, or fewer with --preview)."),
@@ -1326,6 +1345,7 @@ def expand(
     import numpy as np
 
     from soto import anamorphic, blend
+    from soto import caption as caption_module
     from soto import focus as focus_module
     from soto import video
 
@@ -1382,6 +1402,12 @@ def expand(
                 workdir.write_stills({f: render_one(f) for f in still_frames}, stills_dir)
             shutil.rmtree(conform_dir, ignore_errors=True)
             workdir.finish()
+
+        if prompt is None:
+            prompt, prompt_source, caption = _caption_prompt(clip, info, source, caption_module)
+        else:
+            prompt_source, caption = "user", None
+        log.settings.update({"prompt_source": prompt_source, "caption": caption})
 
         area, steps = _resolve_quality(preview, steps, log)
         width, height = _fit_working_resolution(out_w, out_h, area)

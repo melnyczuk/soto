@@ -97,6 +97,10 @@ DEPTH_MODEL_DIR = MODELS_DIR / "depth" / "Depth-Anything-V2-Small-hf"
 # (Apache-2.0; ~110MB, fetched by `soto setup`).
 SEGMENT_MODEL_REPO = "nielsr/slimsam-50-uniform"
 SEGMENT_MODEL_DIR = MODELS_DIR / "segment" / "slimsam-50-uniform"
+# Qwen3.5-4B, a vision-language model that captions the clip for `expand`'s
+# prompt when --prompt isn't given (Apache-2.0; ~9GB, fetched by `soto setup`).
+CAPTION_MODEL_REPO = "Qwen/Qwen3.5-4B"
+CAPTION_MODEL_DIR = MODELS_DIR / "caption" / "Qwen3.5-4B"
 
 # FLUX.1 Fill [dev], an image model made for in- and outpainting, for
 # `soto expand` (FLUX.1 [dev] Non-Commercial License;
@@ -249,8 +253,11 @@ EXPAND_BRIDGE_MASK = 0.8
 # How far the new edges' brightness, contrast and colour are matched to the
 # footage beside them after VACE (see blend.py): 1 fully, 0 not at all.
 EXPAND_COLOUR_MATCH = 1.0
-# What Flux and VACE are asked to paint outside the clip; describing the whole scene helps.
-DEFAULT_EXPAND_PROMPT = (
+# What Flux and VACE are asked to paint outside the clip; describing the whole
+# scene helps. Without --prompt, a caption of the clip (caption.py) goes in
+# front of this; without the caption model, it's used on its own.
+EXPAND_PROMPT_TAIL = (
     "the scene continuing naturally beyond the edges of the frame, consistent lighting and perspective, "
     "coherent scene, smooth continuous motion, high quality"
 )
+DEFAULT_EXPAND_PROMPT = EXPAND_PROMPT_TAIL

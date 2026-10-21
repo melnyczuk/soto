@@ -88,11 +88,13 @@ def download_small_weights() -> None:
 
 
 def download_subject_models() -> None:
-    """The depth and segmentation models `expand` finds the subject with."""
+    """The depth and segmentation models `expand` finds the subject with, and
+    the model it captions the clip with."""
     from huggingface_hub import snapshot_download
 
     for repo, path in ((config.DEPTH_MODEL_REPO, config.DEPTH_MODEL_DIR),
-                       (config.SEGMENT_MODEL_REPO, config.SEGMENT_MODEL_DIR)):
+                       (config.SEGMENT_MODEL_REPO, config.SEGMENT_MODEL_DIR),
+                       (config.CAPTION_MODEL_REPO, config.CAPTION_MODEL_DIR)):
         if (path / "config.json").is_file():
             print(f"  {path.name}: already present")
             continue
@@ -121,7 +123,7 @@ def download_flux_models() -> None:
 def run(flux: bool = False) -> None:
     clone_vendor_repos()
     write_extra_model_paths()
-    print("Downloading VAE, text encoder, depth and segmentation models...")
+    print("Downloading VAE, text encoder, depth, segmentation and caption models...")
     download_small_weights()
     download_subject_models()
     if flux:
