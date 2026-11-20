@@ -65,6 +65,49 @@ finds it.
 On CUDA, ComfyUI manages VRAM itself rather than with `--lowvram`, which
 soto keeps for MPS; `SOTO_VRAM=low|normal|high` overrides either.
 
+## Takes: organising runs for the edit
+
+`soto take` files every run as a numbered take of a scene (the shot list's
+scene ids, e.g. `A4S03`), with a ledger, and writes each one as a ProRes
+422 HQ `.mov` master ready for DaVinci Resolve. Set where takes live once:
+
+```bash
+export SOTO_TAKES=~/Dropbox/Art/proiecta/season_of_the_orb/renders/soto
+```
+
+Then put `soto take run SCENE --brief "..." [--cloud]` in front of a
+generation command, without `-o`:
+
+```bash
+uv run soto take run A4S03 --brief "carry the sock past the cut" --cloud -- \
+    extend ~/rushes/windsock.mp4 --frames 32 --preview fast        # A4S03_t001, a draft
+uv run soto take run A4S03 --brief "full quality" --cloud -- \
+    extend ~/rushes/windsock.mp4 --frames 32 --seed 1234           # A4S03_t002
+uv run soto take run A4S03 --brief "longer, from t002" --cloud -- \
+    extend @t002 --frames 32                                        # made from take 2
+uv run soto take mark A4S03_t002 select --note "the one"
+uv run soto take list A4S03
+```
+
+- `<SOTO_TAKES>/A4S03/` holds `takes.csv` (take, status, date, brief,
+  parent, command, seed, where it ran, how long, soto commit, file, note),
+  the masters `A4S03_t001.mov`... with their `.json` sidecars, and `raw/`,
+  the model's own `.mkv` output, so a take can be re-spliced with
+  `soto crossfade` at another `--fade`.
+- `transition`, `bridge`, `extend` and `dream` are spliced into their
+  footage (`--fade`, default 8 frames) straight into the master; `expand`
+  writes it directly. Anything written to a `.mov` is ProRes 422 HQ with PCM
+  audio, built from lossless pieces.
+- `@t002` stands for that take's master; `@B1_t004` for another scene's.
+  The ledger's `parent` records what each take was made from.
+- A scene's takes share one work dir, so refining reuses what earlier takes
+  made. It's kept out of the (synced) takes folder: in Modal with
+  `--cloud`, else under `$SOTO_WORK` (default `~/.cache/soto/work`).
+- Statuses: `draft` (made with `--preview`), `review`, `select` (one per
+  scene: selecting another moves the old one back to `review`),
+  `rejected`, `failed` (logged, never deleted). A take's file is never
+  rewritten, so Resolve's links never go stale.
+
 ## Usage
 
 Making a video takes two steps. A generation command (`transition`,

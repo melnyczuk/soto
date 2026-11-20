@@ -162,6 +162,28 @@ def conform(input_path: Path, output_path: Path, *, fps: float, width: int, heig
     subprocess.run(cmd, check=True)
 
 
+# Finished footage is H.264 by default. Written to a .mov, it's ProRes 422
+# HQ with PCM audio instead, an edit-ready master for Resolve (`soto take`
+# writes its takes that way), and the pieces it's assembled from are kept
+# lossless on the way there rather than going through H.264 first.
+_H264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+_PRORES = ["-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]
+_LOSSLESS = ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "bgr0"]
+
+
+def is_master(path: Path) -> bool:
+    return path.suffix.lower() == ".mov"
+
+
+def _final_codec(path: Path) -> list[str]:
+    return _PRORES if is_master(path) else _H264
+
+
+def _part_codec(final: Path) -> tuple[str, list[str]]:
+    """The suffix and codec for the pieces of a file assembled into `final`."""
+    return (".mkv", _LOSSLESS) if is_master(final) else (".mp4", _H264)
+
+
 def _pipe_frames(frames: Iterable[np.ndarray], fps: float, output_path: Path, out_args: list[str]) -> int:
     """Encodes (H, W, 3) float32 frames in [0, 1] with ffmpeg, `out_args`
     choosing the filters and codec. The frames are consumed lazily, so they
@@ -188,12 +210,13 @@ def _pipe_frames(frames: Iterable[np.ndarray], fps: float, output_path: Path, ou
 
 
 def _write_frames_to_video(
-    frames: Iterable[np.ndarray], fps: float, out_width: int, out_height: int, output_path: Path
+    frames: Iterable[np.ndarray], fps: float, out_width: int, out_height: int, output_path: Path,
+    codec: list[str] = _H264,
 ) -> None:
     """frames: (N, H, W, 3) float32 in [0, 1] at any resolution -- scaled to
     out_width/out_height. Any iterable of (H, W, 3) frames works too."""
     _pipe_frames(frames, fps, output_path, [
-        "-vf", f"scale={out_width}:{out_height}:flags=lanczos", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-vf", f"scale={out_width}:{out_height}:flags=lanczos", *codec,
     ])
 
 
@@ -257,7 +280,8 @@ def crossfade_frames(
     return (1.0 - alpha) * real + alpha * generated
 
 
-def _trim_frames(input_path: Path, start_frame: int, end_frame: int | None, output_path: Path) -> None:
+def _trim_frames(input_path: Path, start_frame: int, end_frame: int | None, output_path: Path,
+                 codec: list[str] = _H264) -> None:
     """end_frame is exclusive; None means to the end of the clip."""
     if end_frame is not None:
         select = f"between(n\\,{start_frame}\\,{end_frame - 1})"
@@ -266,18 +290,18 @@ def _trim_frames(input_path: Path, start_frame: int, end_frame: int | None, outp
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", str(input_path),
         "-vf", f"select='{select}',setpts=N/FRAME_RATE/TB",
-        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(output_path),
+        "-an", *codec, str(output_path),
     ]
     subprocess.run(cmd, check=True)
 
 
-def _concat(parts: list[Path], output_path: Path) -> None:
+def _concat(parts: list[Path], output_path: Path, codec: list[str] = _H264) -> None:
     list_file = output_path.with_suffix(".concat.txt")
     list_file.write_text("\n".join(f"file '{p.resolve()}'" for p in parts))
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "concat", "-safe", "0", "-i", str(list_file),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(output_path),
+        *codec, str(output_path),
     ]
     subprocess.run(cmd, check=True)
     list_file.unlink()
@@ -329,29 +353,31 @@ def assemble(
     is silent."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="soto-assemble-"))
+    suffix, part_codec = _part_codec(output_path)
+    final_codec = _final_codec(output_path)
     files: list[Path] = []
     for i, part in enumerate(parts):
-        file = tmp_dir / f"part_{i:03d}.mp4"
+        file = tmp_dir / f"part_{i:03d}{suffix}"
         if isinstance(part, Real):
             if part.end <= part.start:
                 continue
-            _trim_frames(part.path, part.start, part.end, file)
+            _trim_frames(part.path, part.start, part.end, file, part_codec)
         elif isinstance(part, Fade):
             if not part.generated.shape[0]:
                 continue
             blended = crossfade_frames(part.path, info, part.start, part.generated, part.fade_in)
-            _write_frames_to_video(blended, info.fps, info.width, info.height, file)
+            _write_frames_to_video(blended, info.fps, info.width, info.height, file, part_codec)
         else:
             if part.end <= part.start:
                 continue
-            _write_frames_to_video(_read_chunked(part), info.fps, info.width, info.height, file)
+            _write_frames_to_video(_read_chunked(part), info.fps, info.width, info.height, file, part_codec)
         files.append(file)
 
     if audio is None:
-        _concat(files, output_path)
+        _concat(files, output_path, final_codec)
     else:
-        video_only = tmp_dir / "video_only.mp4"
-        _concat(files, video_only)
+        video_only = tmp_dir / f"video_only{output_path.suffix}"
+        _concat(files, video_only, final_codec)
         _mux_audio(video_only, audio[0], output_path, offset_s=audio[1])
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -414,7 +440,8 @@ def _mux_audio(video_only: Path, audio_source: Path, output_path: Path, offset_s
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", str(video_only),
         *(["-itsoffset", f"{offset_s:.6f}"] if offset_s else []), "-i", str(audio_source),
-        "-map", "0:v", "-map", "1:a?", "-c:v", "copy", "-c:a", "copy", str(output_path),
+        "-map", "0:v", "-map", "1:a?", "-c:v", "copy",
+        *(["-c:a", "pcm_s16le"] if is_master(output_path) else ["-c:a", "copy"]), str(output_path),
     ]
     subprocess.run(cmd, check=True)
 
@@ -445,7 +472,7 @@ def write_outpaint(frames: Iterable[np.ndarray], fps: float, width: int, height:
     """Encodes `frames` (already at `width`x`height`) with `audio_source`'s audio."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="soto-expand-"))
-    video_only = tmp_dir / "video_only.mp4"
-    _write_frames_to_video(frames, fps, width, height, video_only)
+    video_only = tmp_dir / f"video_only{output_path.suffix}"
+    _write_frames_to_video(frames, fps, width, height, video_only, _final_codec(output_path))
     _mux_audio(video_only, audio_source, output_path)
     shutil.rmtree(tmp_dir, ignore_errors=True)

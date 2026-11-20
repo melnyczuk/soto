@@ -143,6 +143,7 @@ class _Job:
         self.uploads: list[tuple[Path, str]] = []
         self.remote_to_local: dict[str, str] = {}
         self.placed: dict[str, Path] = {}  # out/'s top-level names -> where they go here
+        self.work: tuple[str, Path] | None = None  # (volume path, local path) of a --work dir
         self.out_dir: str | None = None
         self.local_out_dir = Path.cwd()
         self.remote_args = self._rewrite(args)
@@ -161,10 +162,16 @@ class _Job:
 
     def _output(self, option: str, value: str) -> str:
         local = Path(value).expanduser().resolve()
-        # --work is a folder of its own; anything else lands at the top of out/.
-        name = f"{local.name}.work-dir" if option == "--work" else local.name
-        self.placed[name] = local
-        remote = str(JOBS_MOUNT / self.out_dir / name)
+        if option == "--work":
+            # A named work dir lives under work/, by its folder name, apart
+            # from any one output: several outputs (`soto take`'s takes of
+            # one scene) share it, and reuse each other's kept results.
+            rel = f"work/{local.name}"
+            self.work = (rel, local)
+        else:
+            rel = f"{self.out_dir}/{local.name}"
+            self.placed[local.name] = local
+        remote = str(JOBS_MOUNT / rel)
         self.remote_to_local[remote] = str(local)
         return remote
 
@@ -222,14 +229,24 @@ class _Job:
                 continue
             rel = PurePosixPath(entry.path).relative_to(self.out_dir)
             if len(rel.parts) > 1 and not fetch_work:
-                continue  # inside the work dir
+                continue  # inside the default work dir
             top = self.placed.get(rel.parts[0], self.local_out_dir / rel.parts[0])
-            dest = top.joinpath(*rel.parts[1:])
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with dest.open("wb") as f:
-                jobs_volume.read_file_into_fileobj(entry.path, f)
-            if dest.suffix == ".json":
-                self._localize(dest)
+            self._fetch(entry.path, top.joinpath(*rel.parts[1:]))
+        if fetch_work and self.work and _exists(jobs_volume, self.work[0]):
+            rel_root, local_root = self.work
+            for entry in jobs_volume.listdir(rel_root, recursive=True):
+                if entry.type == modal.volume.FileEntryType.FILE:
+                    rel = PurePosixPath(entry.path).relative_to(rel_root)
+                    self._fetch(entry.path, local_root.joinpath(*rel.parts), quiet=True)
+            print(f"  -> {local_root}/")
+
+    def _fetch(self, remote: str, dest: Path, quiet: bool = False) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as f:
+            jobs_volume.read_file_into_fileobj(remote, f)
+        if dest.suffix == ".json":
+            self._localize(dest)
+        if not quiet:
             print(f"  -> {dest}")
 
     def _localize(self, sidecar: Path) -> None:
@@ -266,12 +283,19 @@ def main() -> None:
     if argv[0] == "crossfade":
         print("note: crossfade takes seconds and needs no GPU; `soto crossfade` runs it here.", file=sys.stderr)
 
+    sys.exit(run_remote(argv, gpu=gpu, fetch_work=fetch_work))
+
+
+def run_remote(argv: list[str], gpu: str = DEFAULT_GPU, fetch_work: bool = False) -> int:
+    """Runs `soto <argv>` on a Modal GPU, local paths and all; returns its exit code."""
+    if gpu not in GPUS:
+        raise ValueError(f"gpu must be one of {list(GPUS)}, not {gpu!r}")
     job = _Job(argv)
     with modal.enable_output(), app.run():
         job.upload()
         code = run.with_options(gpu=gpu).remote(job.remote_args)
         job.download(fetch_work)
-    sys.exit(code)
+    return code
 
 
 if __name__ == "__main__":
