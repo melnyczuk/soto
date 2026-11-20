@@ -1654,5 +1654,10 @@ def crossfade(
         _print_done(output, None, None, log, info.fps, generated=False)
 
 
+from soto import takes as _takes  # noqa: E402
+
+app.add_typer(_takes.app, name="take")
+
+
 if __name__ == "__main__":
     app()

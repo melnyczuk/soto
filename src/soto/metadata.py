@@ -179,7 +179,9 @@ class RunLog:
         sidecar.write_text(json.dumps(self.data, indent=2, default=str) + "\n")
         _failure_path(output).unlink(missing_ok=True)  # from an earlier crashed run
         print(f"Metadata: {sidecar}")
-        if chapters:
+        # Not into a .mov master: QuickTime chapters are a text track, which
+        # Resolve would show as one more stream. They're in the sidecar anyway.
+        if chapters and output.suffix.lower() != ".mov":
             try:
                 _embed_chapters(output, chapters, fps)
             except (OSError, subprocess.CalledProcessError) as e:
