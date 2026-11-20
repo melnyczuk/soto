@@ -23,7 +23,7 @@ import torch
 import typer
 from tqdm import tqdm
 
-from soto import config
+from soto import config, device
 
 _node_classes: dict = {}
 
@@ -39,7 +39,10 @@ def _bootstrap() -> None:
     # -- so sys.argv must stay swapped out until that import has happened,
     # otherwise this CLI's own argv leaks into ComfyUI's parser.
     # --lowvram keeps the UNet's weights off the MPS device except while
-    # actually in use.
+    # actually in use, since on a Mac the GPU shares its memory with
+    # everything else. On CUDA the card's memory is its own, so ComfyUI is
+    # left to pick (normal vram on a 24GB card). SOTO_VRAM (low, normal or
+    # high) overrides either.
     # The VAE runs where config.VAE_DEVICE says. It used to be forced onto
     # the CPU (--cpu-vae): encoding N frames at 832x480 on MPS took 2.87GB
     # at N=4, 24.4GB at N=9 and OOM'd at N=17, which looked like the causal
@@ -59,8 +62,12 @@ def _bootstrap() -> None:
     if config.VAE_DTYPE not in config.VAE_DTYPES:
         raise RuntimeError(f"SOTO_VAE_DTYPE must be one of {list(config.VAE_DTYPES)}, not {config.VAE_DTYPE!r}")
     vae_args = ["--cpu-vae"] if config.VAE_DEVICE == "cpu" else [f"--{config.VAE_DTYPE}-vae"]
+    vram = config.VRAM or ("low" if device.pick().type == "mps" else None)
+    if vram not in (None, *config.VRAM_MODES):
+        raise RuntimeError(f"SOTO_VRAM must be one of {list(config.VRAM_MODES)}, not {vram!r}")
+    vram_args = [f"--{vram}vram"] if vram else []
     old_argv, sys.argv = sys.argv, [
-        "comfyui", "--lowvram", *vae_args, "--use-pytorch-cross-attention",
+        "comfyui", *vram_args, *vae_args, "--use-pytorch-cross-attention",
     ]
     try:
         import comfy.options
@@ -130,13 +137,12 @@ def _call(node_cls, **kwargs):
 
 
 def _wait_for(t: torch.Tensor) -> None:
-    """MPS runs asynchronously: a module call returns as soon as its work is
+    """MPS and CUDA run asynchronously: a module call returns as soon as its work is
     queued, so a progress hook that doesn't wait counts it done right away
     and the bar then sits at the end. The work waited on is sequential anyway
     (each VAE chunk needs the last one's cache, each block the last one's
     output), so this costs next to nothing."""
-    if t.device.type == "mps":
-        torch.mps.synchronize()
+    device.synchronize(t.device)
 
 
 @contextmanager

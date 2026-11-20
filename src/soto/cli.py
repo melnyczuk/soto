@@ -348,8 +348,10 @@ def doctor() -> None:
     try:
         import torch
 
-        mps_ok = torch.backends.mps.is_available()
-        print(f"[{'ok' if mps_ok else 'warn'}] torch MPS available (torch {torch.__version__})")
+        from soto import device as soto_device
+
+        gpu_ok = soto_device.pick().type != "cpu"
+        print(f"[{'ok' if gpu_ok else 'warn'}] {soto_device.describe()}")
     except ImportError:
         print("[FAIL] torch not installed (run `uv sync`)")
         ok = False
@@ -826,7 +828,7 @@ def dream(
         conform_dir = Path(tempfile.mkdtemp(prefix="soto-conform-"))
         clip, info = _conform_clip(clip, info, conform_dir, log, "clip")
 
-        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        device = soto_device.pick()
         net, stride, architecture = pix2pixhd.load_generator(weights, device)
         # The generator is fully convolutional, so it runs at the clip's own size
         # (as it was trained on its video's), just rounded to its stride.
@@ -963,7 +965,7 @@ def train(
 
     log = RunLog("train", enabled=not no_metadata)
     with log.guard(out):
-        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        device = soto_device.pick()
         if init or resume:
             # Resuming rebuilds the generator from its own last checkpoint, so
             # it's the architecture it was started with, whatever --ngf says.
