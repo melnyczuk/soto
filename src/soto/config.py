@@ -64,7 +64,7 @@ TEXT_ENCODER_FILENAME = "umt5-xxl-encoder-Q5_K_M.gguf"
 VAE_DIR = MODELS_DIR / "vae"
 TEXT_ENCODERS_DIR = MODELS_DIR / "text_encoders"
 
-# Where Wan's VAE encodes and decodes, "gpu" (MPS) or "cpu", and at what
+# Where Wan's VAE encodes and decodes, "gpu" (CUDA or MPS) or "cpu", and at what
 # precision on the GPU: "bf16", "fp16" or "fp32" (the CPU always uses fp32).
 # The VAE used to be forced onto the CPU after it seemed to leak memory on
 # MPS (24GB at 9 frames, OOM at 17), but that was measured before the
@@ -81,6 +81,11 @@ TEXT_ENCODERS_DIR = MODELS_DIR / "text_encoders"
 VAE_DEVICE = os.environ.get("SOTO_VAE_DEVICE", "gpu")
 VAE_DTYPE = os.environ.get("SOTO_VAE_DTYPE", "bf16")
 VAE_DEVICES = ("gpu", "cpu")
+
+# ComfyUI's VRAM mode: "low", "normal" or "high". Unset, it's low on MPS
+# (the GPU shares the Mac's memory) and ComfyUI's own pick on CUDA.
+VRAM = os.environ.get("SOTO_VRAM") or None
+VRAM_MODES = ("low", "normal", "high")
 VAE_DTYPES = ("bf16", "fp16", "fp32")
 
 # pix2pixHD next-frame generators for `soto dream`, as `<name>.pth`. Not

@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from soto import config, video
+from soto import config, device, video
 
 # How many frames, spread evenly over the clip, the model watches, and the
 # long side they're scaled to.
@@ -64,7 +64,7 @@ def caption_clip(clip: Path, info: video.ClipInfo) -> str:
     if not (config.CAPTION_MODEL_DIR / "config.json").is_file():
         raise FileNotFoundError(f"no caption model in {config.CAPTION_MODEL_DIR}: run `soto setup`, "
                                 "or pass --prompt")
-    dev = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    dev = device.pick()
     frames = _sample_frames(clip, info)
     processor = AutoProcessor.from_pretrained(config.CAPTION_MODEL_DIR)
     model = AutoModelForMultimodalLM.from_pretrained(config.CAPTION_MODEL_DIR, dtype=torch.bfloat16).to(dev).eval()
@@ -78,7 +78,6 @@ def caption_clip(clip: Path, info: video.ClipInfo) -> str:
         reply = processor.decode(out[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
     finally:
         del model
-        if dev.type == "mps":
-            torch.mps.empty_cache()
+        device.empty_cache(dev)
     reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL).strip().strip('"')
     return _strip_colours(reply).rstrip(".")

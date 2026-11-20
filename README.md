@@ -1,7 +1,10 @@
 # soto
 
 A local CLI that generates an AI-blended transition between two video clips,
-running on Apple Silicon (MPS) with a 32GB memory budget in mind.
+running on an NVIDIA GPU (CUDA, locally or on a Modal cloud GPU via
+`soto-cloud`) or on Apple Silicon (MPS) with a 32GB memory budget in mind.
+It picks CUDA, then MPS, then the CPU; `SOTO_DEVICE=cuda|mps|cpu` overrides
+soto's own torch work.
 
 It uses [Wan2.1-VACE](https://github.com/Wan-Video/Wan2.1) (1.3B by default,
 14B GGUF-quantized as an option -- see `--model` below) via a vendored copy of
@@ -23,6 +26,44 @@ uv sync
 uv run soto setup    # vendors ComfyUI + ComfyUI-GGUF, downloads model weights
 uv run soto doctor    # verifies the environment
 ```
+
+## Running on a cloud GPU
+
+`soto-cloud` runs any soto command on a [Modal](https://modal.com) GPU and
+brings the result back, so a long render doesn't tie up the laptop. Billing
+is per second, with nothing to start or stop.
+
+One-time setup, on the machine you'll run it from:
+
+```bash
+uv sync --extra cloud
+uv run modal setup              # signs in; stores a token in ~/.modal.toml
+uv run soto-cloud setup         # fetches the weights into the cloud (add --flux for expand)
+```
+
+The 14B GGUF checkpoints aren't downloaded by `soto setup`; copy them in if
+you want them: `uv run modal volume put soto-models models/Wan2.1_14B_VACE-Q4_K_M.gguf /`.
+
+Then put `soto-cloud` in front of a command:
+
+```bash
+uv run soto-cloud transition clip_a.mp4 clip_b.mp4 -o gen.mkv --duration 1.5
+uv run soto crossfade gen.mkv -o output.mp4 --frames 8    # locally: seconds, no GPU
+```
+
+Local files in the command are uploaded once (stored by content), the log
+streams back as it runs, and the output and its `.json` sidecar land where
+`-o` says, with the sidecar's paths pointed back at your local footage so
+`crossfade` works as usual. The work dir stays in the cloud (the `soto-jobs`
+volume) so a re-run reuses it; `--fetch-work` downloads it too. `soto-cloud
+train` writes the generator into the cloud's models, where `soto-cloud dream`
+finds it.
+
+`--gpu` (before the command) picks the card: `L4` (24GB, default), `A10`,
+`L40S` (48GB), `A100-80GB`, `H100`. `SOTO_CLOUD_GPU` sets the default.
+
+On CUDA, ComfyUI manages VRAM itself rather than with `--lowvram`, which
+soto keeps for MPS; `SOTO_VRAM=low|normal|high` overrides either.
 
 ## Usage
 

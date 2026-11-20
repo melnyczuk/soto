@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from soto import config, video
+from soto import config, device, video
 
 # Long side of the grid the subject is found on. It's smooth, so it's
 # upsampled from there.
@@ -53,7 +53,7 @@ _MOTION_FULL = 0.1
 
 
 def _device() -> torch.device:
-    return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    return device.pick()
 
 
 def _smoothstep(e0: float, e1: float, x: torch.Tensor) -> torch.Tensor:
